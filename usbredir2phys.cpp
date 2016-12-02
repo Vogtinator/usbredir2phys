@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <cstdarg>
 
 #include <fcntl.h>
 #include <signal.h>
@@ -108,7 +109,23 @@ public:
     int fd = -1;
 };
 
+template<typename... Args>
+void usbg_perror(usbg_error e, Args... args)
+{
+    fprintf(stderr, args...);
+    fprintf(stderr, ": %s\n", usbg_strerror(e));
+}
+
 struct PrivUSBG {
+    ~PrivUSBG() {
+        usbg_error e;
+        if(g != nullptr && (e = usbg_error(usbg_rm_gadget(g, USBG_RM_RECURSE))) != USBG_SUCCESS)
+            usbg_perror(e, "usbg_rm_gadget");
+
+        if(s != nullptr)
+            usbg_cleanup(s);
+    }
+
     usbg_state *s;
     usbg_gadget *g;
     usbg_function *f;
@@ -116,13 +133,13 @@ struct PrivUSBG {
 };
 
 struct UR2PPriv {
+    PrivUSBG usbg;
+    TCPConnection con;
     enum {
         NO_IDEA,
         GADGET_READY,
         ENDPOINTS_READY,
     } state;
-    PrivUSBG usbg;
-    TCPConnection con;
 };
 
 /* Set to false in the signal handler. */
@@ -177,7 +194,7 @@ void ur2p_device_connect(void *ppriv, struct usb_redir_device_connect_header *he
 
     if(priv.state != UR2PPriv::NO_IDEA)
     {
-        fprintf(stderr, "Invalid state?\n");
+        fprintf(stderr, "Invalid state!\n");
         return;
     }
 
@@ -189,7 +206,7 @@ void ur2p_device_connect(void *ppriv, struct usb_redir_device_connect_header *he
         .bMaxPacketSize0 = 0x40, /* TODO */
         .idVendor = header->vendor_id,
         .idProduct = header->product_id,
-        .bcdDevice = header->device_version_bcd,
+        .bcdDevice = 0x100, //header->device_version_bcd,
     };
 
     usbg_gadget_strs strs = {
@@ -200,23 +217,33 @@ void ur2p_device_connect(void *ppriv, struct usb_redir_device_connect_header *he
 
     auto e = usbg_error(usbg_create_gadget(priv.usbg.s, "redir0", &attrs, &strs, &priv.usbg.g));
     if(e != USBG_SUCCESS)
-        fprintf(stderr, "usbg_create_gadget: %s\n", usbg_strerror(e));
+        usbg_perror(e, "usbg_create_gadget");
     else
     {
-        printf("Got device %4x:%4x\n", header->vendor_id, header->product_id);
+        printf("Got device %.4x:%.4x\n", header->vendor_id, header->product_id);
         priv.state = UR2PPriv::GADGET_READY;
+
+        e = usbg_error(usbg_create_function(priv.usbg.g, F_FFS, "func0", NULL, &priv.usbg.f));
+        if(e != USBG_SUCCESS)
+            usbg_perror(e, "usbg_create_gadget");
+
+        usbg_config_strs c_strs = {
+                "FUZZ"
+        };
+
+        usbg_create_config(priv.usbg.g, 1, "conf0", NULL, &c_strs, &priv.usbg.c);
+
+        usbg_add_config_function(priv.usbg.c, "confun0", priv.usbg.f);
+
+        e = usbg_error(usbg_enable_gadget(priv.usbg.g, nullptr));
+        if(e != USBG_SUCCESS)
+            fprintf(stderr, "usbg_enable_gadget: %s\n", usbg_strerror(e));
     }
+}
 
-    usbg_create_function(priv.usbg.g, F_FFS, "func0", NULL, &priv.usbg.f);
-
-    usbg_config_strs c_strs = {
-            "FUZZ"
-    };
-    usbg_create_config(priv.usbg.g, 1, "conf0", NULL, &c_strs, &priv.usbg.c);
-
-    usbg_add_config_function(priv.usbg.c, "confun0", priv.usbg.f);
-
-    system("echo musb-hdrc.1.auto > /sys/kernel/config/usb_gadget/redir0/UDC");
+void ur2p_device_disconnect(void *)
+{
+    printf("device disconnected");
 }
 
 void ur2p_interface_info(void *ppriv, struct usb_redir_interface_info_header *header)
@@ -229,7 +256,7 @@ void ur2p_interface_info(void *ppriv, struct usb_redir_interface_info_header *he
         return;
     }
 
-    for (int i = 0; i < header->interface_count; i++) {
+    for (unsigned int i = 0; i < header->interface_count; i++) {
         printf("interface %d class %2d subclass %2d protocol %2d\n",
                header->interface[i], header->interface_class[i],
                header->interface_subclass[i], header->interface_protocol[i]);
@@ -253,6 +280,51 @@ void ur2p_ep_info(void *ppriv, struct usb_redir_ep_info_header *ep_info)
                   (int)ep_info->interface[i]);
        }
     }
+}
+
+void ur2p_configuration_status(void *ppriv, uint64_t id, struct usb_redir_configuration_status_header *config_status)
+{
+    DECL_PRIV;
+}
+
+void ur2p_alt_setting_status(void *ppriv, uint64_t id, struct usb_redir_alt_setting_status_header *alt_setting_status)
+{
+    DECL_PRIV;
+}
+
+void ur2p_iso_stream_status(void *ppriv, uint64_t id, struct usb_redir_iso_stream_status_header *iso_stream_status)
+{
+    DECL_PRIV;
+}
+
+void ur2p_interrupt_receiving_status(void *ppriv, uint64_t id, struct usb_redir_interrupt_receiving_status_header *interrupt_receiving_status)
+{
+    DECL_PRIV;
+}
+
+void ur2p_bulk_streams_status(void *ppriv, uint64_t id, struct usb_redir_bulk_streams_status_header *bulk_streams_status)
+{
+    DECL_PRIV;
+}
+
+void ur2p_control_packet(void *ppriv, uint64_t id, struct usb_redir_control_packet_header *control_packet, uint8_t *data, int data_len)
+{
+    DECL_PRIV;
+}
+
+void ur2p_bulk_packet(void *ppriv, uint64_t id, struct usb_redir_bulk_packet_header *bulk_packet, uint8_t *data, int data_len)
+{
+    DECL_PRIV;
+}
+
+void ur2p_iso_packet(void *ppriv, uint64_t id, struct usb_redir_iso_packet_header *iso_packet, uint8_t *data, int data_len)
+{
+    DECL_PRIV;
+}
+
+void ur2p_interrupt_packet(void *ppriv, uint64_t id, struct usb_redir_interrupt_packet_header *interrupt_packet, uint8_t *data, int data_len)
+{
+    DECL_PRIV;
 }
 
 void ur2p_hello(void *, struct usb_redir_hello_header *header)
@@ -323,9 +395,9 @@ int main(int argc, char **argv)
     parser->read_func = ur2p_read;
     parser->write_func = ur2p_write;
     parser->device_connect_func = ur2p_device_connect;
+    parser->device_disconnect_func = ur2p_device_disconnect;
     parser->interface_info_func = ur2p_interface_info;
     parser->ep_info_func = ur2p_ep_info;
-    /*parser->device_disconnect_func = ur2p_device_disconnect;
     parser->configuration_status_func = ur2p_configuration_status;
     parser->alt_setting_status_func = ur2p_alt_setting_status;
     parser->iso_stream_status_func = ur2p_iso_stream_status;
@@ -333,7 +405,7 @@ int main(int argc, char **argv)
     parser->bulk_streams_status_func = ur2p_bulk_streams_status;
     parser->control_packet_func = ur2p_control_packet;
     parser->bulk_packet_func = ur2p_bulk_packet;
-    parser->iso_packet_func = ur2p_iso_packet;*/
+    parser->iso_packet_func = ur2p_iso_packet;
     parser->hello_func = ur2p_hello;
 
     usbredirparser_init(parser.get(), "UR2P 0.-1", NULL, 0, 0);

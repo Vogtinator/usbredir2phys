@@ -2,8 +2,8 @@ DEBUG := TRUE
 CC  = gcc
 CXX = g++
 
-GCCFLAGS = -Wall -W -Wextra $(shell pkg-config --cflags libusbg) -std=c++17
-LDFLAGS = -lusbredirparser $(shell pkg-config --libs libusbg)
+GCCFLAGS = -Wall -W -Wextra $(shell pkg-config --cflags libusbgx) -std=c++17
+LDFLAGS = -lusbredirparser $(shell pkg-config --libs libusbgx)
 
 ifeq ($(DEBUG),FALSE)
 	GCCFLAGS += -Os
