@@ -1,7 +1,8 @@
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <string>
-#include <cstdarg>
+#include <vector>
 
 #include <fcntl.h>
 #include <signal.h>
@@ -109,6 +110,39 @@ public:
     int fd = -1;
 };
 
+class USBFunctionFs {
+public:
+    ~USBFunctionFs()
+    {
+        if(path.empty())
+            return;
+    }
+
+    bool create(std::string name)
+    {
+        // Check for invalid name
+        if(name.find('\'') != std::string::npos)
+            return false;
+
+        char tmpname[] = "ffsXXXXXX";
+        if(mkdtemp(tmpname) == nullptr)
+            return false;
+
+        path = tmpname;
+
+        std::string command = std::string("mount -t functionfs '" + name + "' " + path);
+        if(system(command.c_str()) == 0)
+                return true;
+
+        rmdir(path.c_str());
+        path = "";
+        return false;
+    }
+
+private:
+    std::string path;
+};
+
 template<typename... Args>
 void usbg_perror(usbg_error e, Args... args)
 {
@@ -135,10 +169,14 @@ struct PrivUSBG {
 struct UR2PPriv {
     PrivUSBG usbg;
     TCPConnection con;
+    usb_redir_interface_info_header ifs;
+    usb_redir_ep_info_header eps;
+    std::vector<USBFunctionFs> functions;
     enum {
         NO_IDEA,
-        GADGET_READY,
+        INTERFACES_READY,
         ENDPOINTS_READY,
+        GADGET_READY,
     } state;
 };
 
@@ -192,7 +230,7 @@ void ur2p_device_connect(void *ppriv, struct usb_redir_device_connect_header *he
 {
     DECL_PRIV;
 
-    if(priv.state != UR2PPriv::NO_IDEA)
+    if(priv.state != UR2PPriv::ENDPOINTS_READY)
     {
         fprintf(stderr, "Invalid state!\n");
         return;
@@ -203,10 +241,10 @@ void ur2p_device_connect(void *ppriv, struct usb_redir_device_connect_header *he
         .bDeviceClass = header->device_class,
         .bDeviceSubClass = header->device_subclass,
         .bDeviceProtocol = header->device_protocol,
-        .bMaxPacketSize0 = 0x40, /* TODO */
+        .bMaxPacketSize0 = static_cast<uint8_t>(priv.eps.max_packet_size[0]),
         .idVendor = header->vendor_id,
         .idProduct = header->product_id,
-        .bcdDevice = 0x100, //header->device_version_bcd,
+        .bcdDevice = header->device_version_bcd,
     };
 
     usbg_gadget_strs strs = {
@@ -250,9 +288,9 @@ void ur2p_interface_info(void *ppriv, struct usb_redir_interface_info_header *he
 {
     DECL_PRIV;
 
-    if(priv.state != UR2PPriv::GADGET_READY)
+    if(priv.state != UR2PPriv::NO_IDEA)
     {
-        fprintf(stderr, "Invalid state?\n");
+        fprintf(stderr, "Invalid state!\n");
         return;
     }
 
@@ -261,15 +299,17 @@ void ur2p_interface_info(void *ppriv, struct usb_redir_interface_info_header *he
                header->interface[i], header->interface_class[i],
                header->interface_subclass[i], header->interface_protocol[i]);
     }
+
+    priv.state = UR2PPriv::INTERFACES_READY;
 }
 
 void ur2p_ep_info(void *ppriv, struct usb_redir_ep_info_header *ep_info)
 {
     DECL_PRIV;
 
-    if(priv.state != UR2PPriv::GADGET_READY)
+    if(priv.state != UR2PPriv::INTERFACES_READY)
     {
-        fprintf(stderr, "Invalid state?\n");
+        fprintf(stderr, "Invalid state!\n");
         return;
     }
 
@@ -280,6 +320,8 @@ void ur2p_ep_info(void *ppriv, struct usb_redir_ep_info_header *ep_info)
                   (int)ep_info->interface[i]);
        }
     }
+
+    priv.state = UR2PPriv::ENDPOINTS_READY;
 }
 
 void ur2p_configuration_status(void *ppriv, uint64_t id, struct usb_redir_configuration_status_header *config_status)
@@ -378,7 +420,7 @@ int main(int argc, char **argv)
     if(ret != USBG_SUCCESS)
     {
         fprintf(stderr, "Could not initialize usbg: %s\n", usbg_strerror(ret));
-        fprintf(stderr, "Make sure configgs is mounted at /sys/kernel/config and the libcomposite kernel module is loaded.");
+        fprintf(stderr, "Make sure configfs is mounted at /sys/kernel/config and the libcomposite kernel module is loaded.\n");
         return 1;
     }
 
@@ -408,7 +450,13 @@ int main(int argc, char **argv)
     parser->iso_packet_func = ur2p_iso_packet;
     parser->hello_func = ur2p_hello;
 
-    usbredirparser_init(parser.get(), "UR2P 0.-1", NULL, 0, 0);
+    uint32_t caps[USB_REDIR_CAPS_SIZE] = {0};
+
+    usbredirparser_caps_set_cap(caps, usb_redir_cap_connect_device_version);
+    usbredirparser_caps_set_cap(caps, usb_redir_cap_ep_info_max_packet_size);
+    usbredirparser_caps_set_cap(caps, usb_redir_cap_64bits_ids);
+
+    usbredirparser_init(parser.get(), "UR2P 0.-1", caps, USB_REDIR_CAPS_SIZE, 0);
 
     puts("Initialized.");
 
