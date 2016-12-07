@@ -1,3 +1,5 @@
 Makefile
 usbredir2phys.ctempl
 usbredir2phys.cpp
+usb.h
+usbdevice.h

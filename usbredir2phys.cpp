@@ -18,6 +18,11 @@ extern "C" {
 #include <usbg/usbg.h>
 }
 
+#include "usbdevice.h"
+
+/* Various constants */
+const constexpr uint32_t EP0_QUERY_ID = 0x71FEBEEF;
+
 /* Simple RAII deleter */
 template<typename T>
 using scope_ptr = std::unique_ptr<T, void(*)(T*)>;
@@ -169,14 +174,14 @@ struct PrivUSBG {
 struct UR2PPriv {
     PrivUSBG usbg;
     TCPConnection con;
-    usb_redir_interface_info_header ifs;
-    usb_redir_ep_info_header eps;
+    scope_ptr<usbredirparser> parser{nullptr, usbredirparser_destroy};
     std::vector<USBFunctionFs> functions;
+    USBDevice device;
+
     enum {
         NO_IDEA,
-        INTERFACES_READY,
-        ENDPOINTS_READY,
-        GADGET_READY,
+        DEV_DESC_QUERIED,
+        CONF_DESC_QUERIED
     } state;
 };
 
@@ -194,48 +199,9 @@ void setup_signals()
         sigaction(i, &sa, NULL);
 }
 
-/* Parser callbacks */
-#define DECL_PRIV UR2PPriv &priv = *reinterpret_cast<UR2PPriv*>(ppriv)
-
-void ur2p_log(void *, int, const char *msg)
+/*
+void gadget_init()
 {
-    printf("%s\n", msg);
-}
-
-int ur2p_read(void *ppriv, uint8_t *data, int count)
-{
-    DECL_PRIV;
-
-    ssize_t r = priv.con.read(data, size_t(count));
-
-    if(r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-        return 0;
-
-    return int(r);
-}
-
-int ur2p_write(void *ppriv, uint8_t *data, int count)
-{
-    DECL_PRIV;
-
-    ssize_t r = priv.con.write(data, size_t(count));
-
-    if(r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-        return 0;
-
-    return int(r);
-}
-
-void ur2p_device_connect(void *ppriv, struct usb_redir_device_connect_header *header)
-{
-    DECL_PRIV;
-
-    if(priv.state != UR2PPriv::ENDPOINTS_READY)
-    {
-        fprintf(stderr, "Invalid state!\n");
-        return;
-    }
-
     usbg_gadget_attrs attrs = {
         .bcdUSB = 0x0200,
         .bDeviceClass = header->device_class,
@@ -277,14 +243,41 @@ void ur2p_device_connect(void *ppriv, struct usb_redir_device_connect_header *he
         if(e != USBG_SUCCESS)
             fprintf(stderr, "usbg_enable_gadget: %s\n", usbg_strerror(e));
     }
-}
+}*/
 
-void ur2p_device_disconnect(void *)
+/* Parser callbacks */
+#define DECL_PRIV UR2PPriv &priv = *reinterpret_cast<UR2PPriv*>(ppriv)
+
+void ur2p_log(void *, int, const char *msg)
 {
-    printf("device disconnected");
+    printf("%s\n", msg);
 }
 
-void ur2p_interface_info(void *ppriv, struct usb_redir_interface_info_header *header)
+int ur2p_read(void *ppriv, uint8_t *data, int count)
+{
+    DECL_PRIV;
+
+    ssize_t r = priv.con.read(data, size_t(count));
+
+    if(r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        return 0;
+
+    return int(r);
+}
+
+int ur2p_write(void *ppriv, uint8_t *data, int count)
+{
+    DECL_PRIV;
+
+    ssize_t r = priv.con.write(data, size_t(count));
+
+    if(r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        return 0;
+
+    return int(r);
+}
+
+void ur2p_device_connect(void *ppriv, struct usb_redir_device_connect_header *)
 {
     DECL_PRIV;
 
@@ -294,34 +287,34 @@ void ur2p_interface_info(void *ppriv, struct usb_redir_interface_info_header *he
         return;
     }
 
-    for (unsigned int i = 0; i < header->interface_count; i++) {
-        printf("interface %d class %2d subclass %2d protocol %2d\n",
-               header->interface[i], header->interface_class[i],
-               header->interface_subclass[i], header->interface_protocol[i]);
-    }
+    usb_redir_control_packet_header header = {
+        .endpoint = USB_DIR_IN,
+        .request = USB_REQ_GET_DESCRIPTOR,
+        .requesttype = USB_DIR_IN,
+        .status = usb_redir_success,
+        .value = (USB_DT_DEVICE << 8) | USB_RECIP_DEVICE,
+        .index = 0,
+        .length = sizeof(usb_device_descriptor)
+    };
 
-    priv.state = UR2PPriv::INTERFACES_READY;
+    usbredirparser_send_control_packet(priv.parser.get(), EP0_QUERY_ID, &header, NULL, 0);
+
+    priv.state = UR2PPriv::DEV_DESC_QUERIED;
 }
 
-void ur2p_ep_info(void *ppriv, struct usb_redir_ep_info_header *ep_info)
+void ur2p_device_disconnect(void *)
 {
-    DECL_PRIV;
+    printf("device disconnected");
+}
 
-    if(priv.state != UR2PPriv::INTERFACES_READY)
-    {
-        fprintf(stderr, "Invalid state!\n");
-        return;
-    }
+void ur2p_interface_info(void *, struct usb_redir_interface_info_header *)
+{
+    printf("Got interface info\n");
+}
 
-    for (int i = 0; i < 32; i++) {
-       if (ep_info->type[i] != usb_redir_type_invalid) {
-           printf("endpoint: %02X, type: %d, interval: %d, interface: %d\n",
-                  i, (int)ep_info->type[i], (int)ep_info->interval[i],
-                  (int)ep_info->interface[i]);
-       }
-    }
-
-    priv.state = UR2PPriv::ENDPOINTS_READY;
+void ur2p_ep_info(void *, struct usb_redir_ep_info_header *)
+{
+    printf("Got endpoint info\n");
 }
 
 void ur2p_configuration_status(void *ppriv, uint64_t id, struct usb_redir_configuration_status_header *config_status)
@@ -352,6 +345,135 @@ void ur2p_bulk_streams_status(void *ppriv, uint64_t id, struct usb_redir_bulk_st
 void ur2p_control_packet(void *ppriv, uint64_t id, struct usb_redir_control_packet_header *control_packet, uint8_t *data, int data_len)
 {
     DECL_PRIV;
+
+    if(id == EP0_QUERY_ID)
+    {
+        if(priv.state == UR2PPriv::DEV_DESC_QUERIED)
+        {
+            if(unsigned(data_len) != sizeof(priv.device.desc))
+            {
+                fprintf(stderr, "Invalid control packet len.\n");
+                return;
+            }
+            memcpy(&priv.device.desc, data, data_len);
+            if(priv.device.desc.bDescriptorType != USB_DT_DEVICE)
+                fprintf(stderr, "Not a device descriptor?\n");
+            else
+                printf("Got device descriptor (%.4x:%.4x)\n", priv.device.desc.idVendor, priv.device.desc.idProduct);
+        }
+        else if(priv.state == UR2PPriv::CONF_DESC_QUERIED)
+        {
+            if(unsigned(data_len) < sizeof(usb_config_descriptor))
+            {
+                fprintf(stderr, "Invalid control packet len.\n");
+                return;
+            }
+
+            usb_config_descriptor desc;
+            memcpy(&desc, data, sizeof(desc));
+            data_len -= sizeof(usb_config_descriptor);
+            data += sizeof(usb_config_descriptor);
+
+            USBConfiguration &current_conf = priv.device.configs[desc.iConfiguration];
+            if(current_conf.desc.bDescriptorType != 0)
+                fprintf(stderr, "Config already seen!\n");
+
+            current_conf.desc = desc;
+
+            if(desc.bDescriptorType != USB_DT_CONFIG)
+                fprintf(stderr, "Not a config descriptor?\n");
+            else
+                printf("Got config %d descriptors\n", desc.iConfiguration);
+
+            /* Step through data to collect additional descriptors */
+            while(data_len > 0)
+            {
+                auto *d_type = reinterpret_cast<usb_string_descriptor*>(data);
+                switch(d_type->bDescriptorType)
+                {
+                case USB_DT_INTERFACE:
+                {
+                    if(unsigned(data_len) < sizeof(usb_interface_descriptor))
+                    {
+                        fprintf(stderr, "Invalid descriptor size\n");
+                        return;
+                    }
+
+                    usb_interface_descriptor idesc;
+                    memcpy(&idesc, data, sizeof(idesc));
+
+                    USBInterface intf;
+                    intf.desc = idesc;
+                    current_conf.interfaces.emplace_back(std::move(intf));
+
+                    printf("Got interface %d descriptor\n", idesc.bInterfaceNumber);
+                    break;
+                }
+                case USB_DT_ENDPOINT:
+                {
+                    if(unsigned(data_len) < sizeof(usb_endpoint_descriptor))
+                    {
+                        fprintf(stderr, "Invalid descriptor size\n");
+                        return;
+                    }
+
+                    if(current_conf.interfaces.size() == 0)
+                    {
+                        fprintf(stderr, "Endpoint without interface?\n");
+                        return;
+                    }
+
+                    usb_endpoint_descriptor edesc;
+                    memcpy(&edesc, data, sizeof(edesc));
+
+                    /* Add endpoint */
+                    priv.device.endpoints[epAddrToIndex(edesc.bEndpointAddress)].desc = edesc;
+
+                    /* Add endpoint to interface */
+                    current_conf.interfaces.back().endpoints.push_back(edesc.bEndpointAddress);
+
+                    printf("Got endpoint 0x%.2x descriptor\n", edesc.bEndpointAddress);
+                    break;
+                }
+                default:
+                    fprintf(stderr, "Unhandled case 0x%.2x\n", d_type->bDescriptorType);
+                    break;
+                }
+
+                if(data_len < d_type->bLength)
+                {
+                    fprintf(stderr, "Invalid bLength!\n");
+                    return;
+                }
+
+                data_len -= d_type->bLength;
+                data += d_type->bLength;
+            }
+        }
+
+        if(priv.device.configs.size() != priv.device.desc.bNumConfigurations)
+        {
+            usb_redir_control_packet_header header = {
+                .endpoint = USB_DIR_IN,
+                .request = USB_REQ_GET_DESCRIPTOR,
+                .requesttype = USB_DIR_IN,
+                .status = usb_redir_success,
+                .value = (USB_DT_CONFIG << 8) | USB_RECIP_DEVICE,
+                .index = uint16_t(priv.device.configs.size()),
+                .length = 0xFF
+            };
+
+            usbredirparser_send_control_packet(priv.parser.get(), EP0_QUERY_ID, &header, NULL, 0);
+
+            priv.state = UR2PPriv::CONF_DESC_QUERIED;
+        }
+        else if(priv.state == UR2PPriv::CONF_DESC_QUERIED)
+        {
+            /* Last config descriptor arrived */
+
+            //TODO: String descriptors
+        }
+    }
 }
 
 void ur2p_bulk_packet(void *ppriv, uint64_t id, struct usb_redir_bulk_packet_header *bulk_packet, uint8_t *data, int data_len)
@@ -373,7 +495,6 @@ void ur2p_hello(void *, struct usb_redir_hello_header *header)
 {
     printf("Connected to %.64s.\n", header->version);
 }
-
 
 int main(int argc, char **argv)
 {
@@ -424,13 +545,15 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    scope_ptr<usbredirparser> parser(usbredirparser_create(), usbredirparser_destroy);
+    priv.parser = scope_ptr<usbredirparser>(usbredirparser_create(), usbredirparser_destroy);
 
-    if(!parser)
+    if(!priv.parser)
     {
         fprintf(stderr, "Could not create parser.\n");
         return 1;
     }
+
+    usbredirparser *parser = priv.parser.get();
 
     parser->priv = &priv;
     parser->log_func = ur2p_log;
@@ -454,15 +577,16 @@ int main(int argc, char **argv)
 
     usbredirparser_caps_set_cap(caps, usb_redir_cap_connect_device_version);
     usbredirparser_caps_set_cap(caps, usb_redir_cap_ep_info_max_packet_size);
-    usbredirparser_caps_set_cap(caps, usb_redir_cap_64bits_ids);
+    // fdo#
+    //usbredirparser_caps_set_cap(caps, usb_redir_cap_64bits_ids);
 
-    usbredirparser_init(parser.get(), "UR2P 0.-1", caps, USB_REDIR_CAPS_SIZE, 0);
+    usbredirparser_init(parser, "UR2P 0.-1", caps, USB_REDIR_CAPS_SIZE, 0);
 
     puts("Initialized.");
 
     /* We need the connect packet first. */
-    usbredirparser_send_reset(parser.get());
-    usbredirparser_send_get_configuration(parser.get(), 0);
+    usbredirparser_send_reset(parser);
+    usbredirparser_send_get_configuration(parser, 0);
 
     while(keep_running && priv.con.fd != -1)
     {
@@ -471,7 +595,7 @@ int main(int argc, char **argv)
         FD_ZERO(&wfds);
 
         FD_SET(priv.con.fd, &rfds);
-        if(usbredirparser_has_data_to_write(parser.get()))
+        if(usbredirparser_has_data_to_write(parser))
             FD_SET(priv.con.fd, &wfds);
 
         if(select(priv.con.fd + 1, &rfds, &wfds, NULL, NULL) == -1)
@@ -483,13 +607,13 @@ int main(int argc, char **argv)
             break;
         }
 
-        if(FD_ISSET(priv.con.fd, &rfds) && usbredirparser_do_read(parser.get()) != 0)
+        if(FD_ISSET(priv.con.fd, &rfds) && usbredirparser_do_read(parser) != 0)
         {
             fprintf(stderr, "Read error.\n");
             break;
         }
 
-        if(FD_ISSET(priv.con.fd, &wfds) && usbredirparser_do_write(parser.get()) != 0)
+        if(FD_ISSET(priv.con.fd, &wfds) && usbredirparser_do_write(parser) != 0)
         {
             fprintf(stderr, "Write error.\n");
             break;

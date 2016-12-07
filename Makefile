@@ -2,7 +2,7 @@ DEBUG := TRUE
 CC  = gcc
 CXX = g++
 
-GCCFLAGS = -Wall -W -Wextra $(shell pkg-config --cflags libusbgx) -std=c++17
+GCCFLAGS = -Wall -W -Wextra $(shell pkg-config --cflags libusbgx) -std=c++17 -Wno-unused-parameter -Wno-unused-variable
 LDFLAGS = -lusbredirparser $(shell pkg-config --libs libusbgx)
 
 ifeq ($(DEBUG),FALSE)
