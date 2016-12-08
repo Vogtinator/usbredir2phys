@@ -1,6 +1,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <codecvt>
 #include <string>
 #include <vector>
 
@@ -177,11 +178,15 @@ struct UR2PPriv {
     scope_ptr<usbredirparser> parser{nullptr, usbredirparser_destroy};
     std::vector<USBFunctionFs> functions;
     USBDevice device;
+    // To be requested
+    std::vector<uint32_t> missing_strings;
 
     enum {
         NO_IDEA,
         DEV_DESC_QUERIED,
-        CONF_DESC_QUERIED
+        CONF_DESC_QUERIED,
+        STR0_DESC_QUERIED,
+        STR_DESC_QUERIED
     } state;
 };
 
@@ -342,115 +347,178 @@ void ur2p_bulk_streams_status(void *ppriv, uint64_t id, struct usb_redir_bulk_st
     DECL_PRIV;
 }
 
+void ur2p_device_descriptor(UR2PPriv &priv, usb_device_descriptor *desc)
+{
+    priv.device.desc = *desc;
+
+    if(priv.device.desc.bDescriptorType != USB_DT_DEVICE)
+        fprintf(stderr, "Not a device descriptor?\n");
+    else
+        printf("Got device descriptor (%.4x:%.4x)\n", priv.device.desc.idVendor, priv.device.desc.idProduct);
+}
+
+void ur2p_config_descriptor(UR2PPriv &priv, uint8_t *data, int data_len)
+{
+    usb_config_descriptor desc;
+    memcpy(&desc, data, sizeof(desc));
+    data_len -= sizeof(usb_config_descriptor);
+    data += sizeof(usb_config_descriptor);
+
+    auto index = priv.device.configs.size();
+    priv.device.configs.push_back({});
+
+    USBConfiguration &current_conf = priv.device.configs[index];
+    if(current_conf.desc.bDescriptorType != 0)
+        fprintf(stderr, "Config already seen!\n");
+
+    current_conf.desc = desc;
+
+    if(desc.bDescriptorType != USB_DT_CONFIG)
+        fprintf(stderr, "Not a config descriptor?\n");
+    else
+        printf("Configuration %lu\n", index);
+
+    /* Step through data to collect additional descriptors */
+    while(data_len > 0)
+    {
+        auto *d_type = reinterpret_cast<usb_string_descriptor*>(data);
+        switch(d_type->bDescriptorType)
+        {
+        case USB_DT_INTERFACE:
+        {
+            if(unsigned(data_len) < sizeof(usb_interface_descriptor))
+            {
+                fprintf(stderr, "Invalid descriptor size\n");
+                return;
+            }
+
+            usb_interface_descriptor idesc;
+            memcpy(&idesc, data, sizeof(idesc));
+
+            USBInterface intf;
+            intf.desc = idesc;
+            current_conf.interfaces.emplace_back(std::move(intf));
+
+            printf("`Interface %d\n", idesc.bInterfaceNumber);
+            break;
+        }
+        case USB_DT_ENDPOINT:
+        {
+            if(unsigned(data_len) < sizeof(usb_endpoint_descriptor))
+            {
+                fprintf(stderr, "Invalid descriptor size\n");
+                return;
+            }
+
+            if(current_conf.interfaces.size() == 0)
+            {
+                fprintf(stderr, "Endpoint without interface?\n");
+                return;
+            }
+
+            usb_endpoint_descriptor edesc;
+            memcpy(&edesc, data, sizeof(edesc));
+
+            /* Add endpoint */
+            priv.device.endpoints[epAddrToIndex(edesc.bEndpointAddress)].desc = edesc;
+
+            /* Add endpoint to interface */
+            current_conf.interfaces.back().endpoints.push_back(edesc.bEndpointAddress);
+
+            printf("\t`Endpoint 0x%.2x\n", edesc.bEndpointAddress);
+            break;
+        }
+        default:
+            fprintf(stderr, "Unhandled case 0x%.2x\n", d_type->bDescriptorType);
+            break;
+        }
+
+        if(data_len < d_type->bLength)
+        {
+            fprintf(stderr, "Invalid bLength!\n");
+            return;
+        }
+
+        data_len -= d_type->bLength;
+        data += d_type->bLength;
+    }
+}
+
+void ur2p_string_descriptor(UR2PPriv &priv, usb_string_descriptor *desc, size_t size)
+{
+    if(desc->bDescriptorType != USB_DT_STRING)
+        fprintf(stderr, "Not a string descriptor!\n");
+
+    std::u16string string{desc->wData, size - sizeof(usb_string_descriptor)};
+    std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t> conv;
+    printf("%s\n", conv.to_bytes(string).c_str());
+}
+
+void ur2p_str0_descriptor(UR2PPriv &priv, usb_string_descriptor *desc, size_t size)
+{
+    if(desc->bDescriptorType != USB_DT_STRING)
+        fprintf(stderr, "Not a string descriptor!\n");
+
+    /* Save available lang ids */
+    size -= sizeof(*desc);
+    for(unsigned int i = 0; i < size / 2; ++i)
+        priv.device.strings.langs.push_back(desc->wData[i]);
+}
+
 void ur2p_control_packet(void *ppriv, uint64_t id, struct usb_redir_control_packet_header *control_packet, uint8_t *data, int data_len)
 {
     DECL_PRIV;
 
+    /* I don't understand the use of signed sizes... */
+    assert(data_len >= 0);
+
     if(id == EP0_QUERY_ID)
     {
+        /* Process input */
         if(priv.state == UR2PPriv::DEV_DESC_QUERIED)
         {
-            if(unsigned(data_len) != sizeof(priv.device.desc))
+            if(size_t(data_len) != sizeof(usb_device_descriptor))
             {
                 fprintf(stderr, "Invalid control packet len.\n");
                 return;
             }
-            memcpy(&priv.device.desc, data, data_len);
-            if(priv.device.desc.bDescriptorType != USB_DT_DEVICE)
-                fprintf(stderr, "Not a device descriptor?\n");
-            else
-                printf("Got device descriptor (%.4x:%.4x)\n", priv.device.desc.idVendor, priv.device.desc.idProduct);
+
+            ur2p_device_descriptor(priv, reinterpret_cast<usb_device_descriptor*>(data));
         }
         else if(priv.state == UR2PPriv::CONF_DESC_QUERIED)
         {
-            if(unsigned(data_len) < sizeof(usb_config_descriptor))
+            if(size_t(data_len) < sizeof(usb_config_descriptor))
             {
                 fprintf(stderr, "Invalid control packet len.\n");
                 return;
             }
 
-            usb_config_descriptor desc;
-            memcpy(&desc, data, sizeof(desc));
-            data_len -= sizeof(usb_config_descriptor);
-            data += sizeof(usb_config_descriptor);
-
-            USBConfiguration &current_conf = priv.device.configs[desc.iConfiguration];
-            if(current_conf.desc.bDescriptorType != 0)
-                fprintf(stderr, "Config already seen!\n");
-
-            current_conf.desc = desc;
-
-            if(desc.bDescriptorType != USB_DT_CONFIG)
-                fprintf(stderr, "Not a config descriptor?\n");
-            else
-                printf("Got config %d descriptors\n", desc.iConfiguration);
-
-            /* Step through data to collect additional descriptors */
-            while(data_len > 0)
+            ur2p_config_descriptor(priv, data, data_len);
+        }
+        else if(priv.state == UR2PPriv::STR0_DESC_QUERIED)
+        {
+            if(size_t(data_len) < sizeof(usb_string_descriptor))
             {
-                auto *d_type = reinterpret_cast<usb_string_descriptor*>(data);
-                switch(d_type->bDescriptorType)
-                {
-                case USB_DT_INTERFACE:
-                {
-                    if(unsigned(data_len) < sizeof(usb_interface_descriptor))
-                    {
-                        fprintf(stderr, "Invalid descriptor size\n");
-                        return;
-                    }
-
-                    usb_interface_descriptor idesc;
-                    memcpy(&idesc, data, sizeof(idesc));
-
-                    USBInterface intf;
-                    intf.desc = idesc;
-                    current_conf.interfaces.emplace_back(std::move(intf));
-
-                    printf("Got interface %d descriptor\n", idesc.bInterfaceNumber);
-                    break;
-                }
-                case USB_DT_ENDPOINT:
-                {
-                    if(unsigned(data_len) < sizeof(usb_endpoint_descriptor))
-                    {
-                        fprintf(stderr, "Invalid descriptor size\n");
-                        return;
-                    }
-
-                    if(current_conf.interfaces.size() == 0)
-                    {
-                        fprintf(stderr, "Endpoint without interface?\n");
-                        return;
-                    }
-
-                    usb_endpoint_descriptor edesc;
-                    memcpy(&edesc, data, sizeof(edesc));
-
-                    /* Add endpoint */
-                    priv.device.endpoints[epAddrToIndex(edesc.bEndpointAddress)].desc = edesc;
-
-                    /* Add endpoint to interface */
-                    current_conf.interfaces.back().endpoints.push_back(edesc.bEndpointAddress);
-
-                    printf("Got endpoint 0x%.2x descriptor\n", edesc.bEndpointAddress);
-                    break;
-                }
-                default:
-                    fprintf(stderr, "Unhandled case 0x%.2x\n", d_type->bDescriptorType);
-                    break;
-                }
-
-                if(data_len < d_type->bLength)
-                {
-                    fprintf(stderr, "Invalid bLength!\n");
-                    return;
-                }
-
-                data_len -= d_type->bLength;
-                data += d_type->bLength;
+                fprintf(stderr, "Invalid control packet len.\n");
+                return;
             }
+
+            ur2p_str0_descriptor(priv, reinterpret_cast<usb_string_descriptor*>(data), size_t(data_len));
+        }
+        else if(priv.state == UR2PPriv::STR_DESC_QUERIED)
+        {
+            if(size_t(data_len) < sizeof(usb_string_descriptor))
+            {
+                fprintf(stderr, "Invalid control packet len.\n");
+                return;
+            }
+
+            ur2p_string_descriptor(priv, reinterpret_cast<usb_string_descriptor*>(data), size_t(data_len));
         }
 
+        /* Generate output */
+
+        // Need to fetch config descriptors?
         if(priv.device.configs.size() != priv.device.desc.bNumConfigurations)
         {
             usb_redir_control_packet_header header = {
@@ -466,12 +534,73 @@ void ur2p_control_packet(void *ppriv, uint64_t id, struct usb_redir_control_pack
             usbredirparser_send_control_packet(priv.parser.get(), EP0_QUERY_ID, &header, NULL, 0);
 
             priv.state = UR2PPriv::CONF_DESC_QUERIED;
+            return;
         }
         else if(priv.state == UR2PPriv::CONF_DESC_QUERIED)
         {
-            /* Last config descriptor arrived */
+            /* Last config descriptor arrived, query STR0 descriptor for LANGID list */
 
-            //TODO: String descriptors
+            usb_redir_control_packet_header header = {
+                .endpoint = USB_DIR_IN,
+                .request = USB_REQ_GET_DESCRIPTOR,
+                .requesttype = USB_DIR_IN,
+                .status = usb_redir_success,
+                .value = (USB_DT_STRING << 8) | 0,
+                .index = 0,
+                .length = 0xFF
+            };
+
+            usbredirparser_send_control_packet(priv.parser.get(), EP0_QUERY_ID, &header, NULL, 0);
+
+            priv.state = UR2PPriv::STR0_DESC_QUERIED;
+            return;
+        }
+
+        if(priv.state == UR2PPriv::STR0_DESC_QUERIED)
+        {
+            /* Got STR0 descriptor, make a list of all referenced strings */
+
+            std::vector<uint8_t> strings;
+            /* Referenced by device descriptor */
+            strings.insert(strings.end(), {priv.device.desc.iManufacturer, priv.device.desc.iProduct, priv.device.desc.iSerialNumber});
+            /* Referenced by config descriptors */
+            for(auto &c : priv.device.configs)
+            {
+                strings.push_back(c.desc.iConfiguration);
+                /* References by interface descriptors */
+                for(auto &i : c.interfaces)
+                    strings.push_back(i.desc.iInterface);
+            }
+
+            for(auto i : strings)
+            {
+                if(i == 0)
+                    continue;
+                for(auto langid : priv.device.strings.langs)
+                    priv.missing_strings.push_back(makeString(langid, i));
+            }
+        }
+
+        // Need to fetch string descriptors?
+        if(!priv.missing_strings.empty())
+        {
+            auto string = priv.missing_strings.back();
+            priv.missing_strings.pop_back();
+
+            usb_redir_control_packet_header header = {
+                .endpoint = USB_DIR_IN,
+                .request = USB_REQ_GET_DESCRIPTOR,
+                .requesttype = USB_DIR_IN,
+                .status = usb_redir_success,
+                .value = (USB_DT_STRING << 8) | stringIndex(string),
+                .index = stringLangID(string),
+                .length = 0xFF
+            };
+
+            usbredirparser_send_control_packet(priv.parser.get(), EP0_QUERY_ID, &header, NULL, 0);
+
+            priv.state = UR2PPriv::STR_DESC_QUERIED;
+            return;
         }
     }
 }

@@ -9,7 +9,22 @@
 
 constexpr size_t epAddrToIndex(uint8_t a)
 {
-    return (a >> 3) | (a & 0xF);
+    return (a & 0x80 >> 3) | (a & 0xF);
+}
+
+constexpr uint8_t stringIndex(uint32_t str)
+{
+    return str & 0xFF;
+}
+
+constexpr uint16_t stringLangID(uint32_t str)
+{
+    return str >> 16;
+}
+
+constexpr uint32_t makeString(uint16_t langid, uint8_t index)
+{
+    return langid << 16 | index;
 }
 
 struct USBEndpoint {
@@ -28,12 +43,18 @@ struct USBConfiguration {
     std::vector<USBInterface> interfaces;
 };
 
+struct USBStrings {
+    std::vector<uint16_t> langs;
+    // Use makeString as index
+    std::map<uint32_t, std::u16string> strings;
+};
+
 struct USBDevice {
     usb_device_descriptor desc;
     uint8_t active_config;
-    std::map<uint8_t, USBConfiguration> configs;
+    std::vector<USBConfiguration> configs;
     USBEndpoint endpoints[32];
-    std::vector<std::u16string> strings;
+    USBStrings strings;
 };
 
 #endif // USBDEVICE_H

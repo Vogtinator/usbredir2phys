@@ -134,7 +134,7 @@ struct usb_config_descriptor {
 struct usb_string_descriptor {
     uint8_t  bLength;
     uint8_t  bDescriptorType;
-    char16_t wData[1];
+    char16_t wData[0];
 } __attribute__ ((packed));
 
 struct usb_interface_descriptor {
