@@ -1,7 +1,7 @@
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
-#include <codecvt>
 #include <string>
 #include <vector>
 
@@ -17,12 +17,14 @@
 
 extern "C" {
 #include <usbg/usbg.h>
+#include <linux/usb/functionfs.h>
 }
 
 #include "usbdevice.h"
 
 /* Various constants */
-const constexpr uint32_t EP0_QUERY_ID = 0x71FEBEEF;
+const constexpr uint32_t EP_FORWARD = 0x71FEBEEF,
+                         EP_PROCESS = 0xDEADBEEF;
 
 /* Simple RAII deleter */
 template<typename T>
@@ -31,6 +33,8 @@ using scope_ptr = std::unique_ptr<T, void(*)(T*)>;
 /* Helper for RAII */
 class TCPConnection {
 public:
+    TCPConnection() = default;
+    TCPConnection(const TCPConnection &other) = delete;
     ~TCPConnection()
     {
         disconnect();
@@ -44,8 +48,8 @@ public:
             return false;
         }
 
-        struct addrinfo hints{};
-        struct addrinfo *res = nullptr;
+        addrinfo hints{};
+        addrinfo *res = nullptr;
 
         hints.ai_flags = AI_ADDRCONFIG | AI_NUMERICSERV;
         hints.ai_family = AF_UNSPEC;
@@ -116,12 +120,34 @@ public:
     int fd = -1;
 };
 
+template <typename T>
+void appendToVector(std::vector<uint8_t> &v, const T &data)
+{
+    v.resize(v.size() + sizeof(T));
+    memcpy(v.data() + v.size() - sizeof(T), &data, sizeof(T));
+}
+
 class USBFunctionFs {
 public:
+    USBFunctionFs() = default;
+    USBFunctionFs(const USBFunctionFs &other) = delete;
+    USBFunctionFs(USBFunctionFs&&) = default;
+    USBFunctionFs& operator = (USBFunctionFs&&) = default;
     ~USBFunctionFs()
     {
         if(path.empty())
             return;
+
+        if(dirfd >= 0)
+            close(dirfd);
+
+        for(auto fd : endpoints)
+            close(fd.second);
+
+        std::string command = std::string("umount " + path);
+        system(command.c_str());
+
+        rmdir(path.c_str());
     }
 
     bool create(std::string name)
@@ -130,23 +156,130 @@ public:
         if(name.find('\'') != std::string::npos)
             return false;
 
-        char tmpname[] = "ffsXXXXXX";
+        char tmpname[] = "/tmp/ffsXXXXXX";
         if(mkdtemp(tmpname) == nullptr)
             return false;
 
         path = tmpname;
 
-        std::string command = std::string("mount -t functionfs '" + name + "' " + path);
+        std::string command = std::string("mount -t functionfs " + name + " " + path);
         if(system(command.c_str()) == 0)
-                return true;
+        {
+            dirfd = open(path.c_str(), O_RDONLY | O_DIRECTORY);
+            return dirfd >= 0;
+        }
 
         rmdir(path.c_str());
         path = "";
         return false;
     }
 
+    int openEP(uint8_t id)
+    {
+        char name[5];
+        snprintf(name, sizeof(name), "ep%x", id);
+        return openat(dirfd, name, O_RDWR);
+    }
+
+    bool fill(const USBDevice &dev, const USBConfiguration &config)
+    {
+        int ep0 = openEP(0);
+
+        if(ep0 == -1)
+        {
+            fprintf(stderr, "Could not open ep0!");
+            return false;
+        }
+
+        endpoints[0] = ep0;
+
+        std::vector<uint8_t> request;
+
+        uint32_t length = sizeof(usb_functionfs_descs_head_v2)
+                          + sizeof(uint32_t) * 2
+                          + config.full_desc.size() * 2;
+
+        request.reserve(length);
+
+        usb_functionfs_descs_head_v2 head {
+            .magic = FUNCTIONFS_DESCRIPTORS_MAGIC_V2,
+            .length = length,
+            .flags = FUNCTIONFS_HAS_FS_DESC | FUNCTIONFS_HAS_HS_DESC
+        };
+
+        appendToVector(request, head);
+
+        /* Count descriptors */
+        uint32_t fs_count = 0;
+        {
+            uint32_t size = config.full_desc.size();
+            const uint8_t *data = config.full_desc.data();
+
+            while(size) {
+                auto *desc = reinterpret_cast<const usb_descriptor_header*>(data);
+                if(desc->bLength < sizeof(usb_descriptor_header) || desc->bLength > size)
+                    break; /* Invalid bLength */
+
+                fs_count += 1;
+                data += desc->bLength;
+                size -= desc->bLength;
+            }
+        }
+
+        if(fs_count == 0)
+        {
+            fprintf(stderr, "Config %d has no valid descriptors!", config.desc.bConfigurationValue);
+            return false;
+        }
+
+        appendToVector(request, uint32_t(fs_count));
+        appendToVector(request, uint32_t(fs_count));
+
+        request.insert(request.end(), config.full_desc.begin(), config.full_desc.end());
+        request.insert(request.end(), config.full_desc.begin(), config.full_desc.end());
+
+        auto e = write(ep0, request.data(), request.size());
+        if(e != ssize_t(request.size()))
+        {
+            perror("FFS EP0 descs write");
+            return false;
+        }
+
+        /* Write string descriptors */
+        request.clear();
+
+        /* TODO: Handle all strings and languages here */
+        auto s = dev.strings.getUTF8(0x409, config.desc.iConfiguration);
+
+        length = sizeof(usb_functionfs_strings_head)
+                 + sizeof(uint16_t)
+                 + s.size();
+
+        usb_functionfs_strings_head shead {
+            .magic = FUNCTIONFS_STRINGS_MAGIC,
+            .length = length,
+            .str_count = 1,
+            .lang_count = 1
+        };
+
+        appendToVector(request, shead);
+        appendToVector(request, uint16_t(0x409));
+        request.insert(request.end(), s.c_str(), s.c_str() + s.size());
+
+        e = write(ep0, request.data(), request.size());
+        if(e != ssize_t(request.size()))
+        {
+            perror("FFS EP0 strss write");
+            return false;
+        }
+
+        return true;
+    }
+
 private:
     std::string path;
+    int dirfd = -1;
+    std::map<uint8_t, int> endpoints;
 };
 
 template<typename... Args>
@@ -159,8 +292,12 @@ void usbg_perror(usbg_error e, Args... args)
 struct PrivUSBG {
     ~PrivUSBG() {
         usbg_error e;
-        if(g != nullptr && (e = usbg_error(usbg_rm_gadget(g, USBG_RM_RECURSE))) != USBG_SUCCESS)
-            usbg_perror(e, "usbg_rm_gadget");
+        if(g != nullptr)
+        {
+            usbg_disable_gadget(g);
+            if((e = usbg_error(usbg_rm_gadget(g, USBG_RM_RECURSE))) != USBG_SUCCESS)
+                usbg_perror(e, "usbg_rm_gadget");
+        }
 
         if(s != nullptr)
             usbg_cleanup(s);
@@ -173,11 +310,18 @@ struct PrivUSBG {
 };
 
 struct UR2PPriv {
+    ~UR2PPriv() {
+        // Need to free up functionfs references first
+        ffs.clear();
+    }
+
     PrivUSBG usbg;
     TCPConnection con;
     scope_ptr<usbredirparser> parser{nullptr, usbredirparser_destroy};
-    std::vector<USBFunctionFs> functions;
+    /* One per configuration */
+    std::vector<USBFunctionFs> ffs;
     USBDevice device;
+
     // To be requested
     std::vector<uint32_t> missing_strings;
 
@@ -186,7 +330,8 @@ struct UR2PPriv {
         DEV_DESC_QUERIED,
         CONF_DESC_QUERIED,
         STR0_DESC_QUERIED,
-        STR_DESC_QUERIED
+        STR_DESC_QUERIED,
+        GADGET_READY
     } state;
 };
 
@@ -204,51 +349,89 @@ void setup_signals()
         sigaction(i, &sa, NULL);
 }
 
-/*
-void gadget_init()
+bool gadget_init(UR2PPriv &priv)
 {
+    auto &dev = priv.device;
+
     usbg_gadget_attrs attrs = {
-        .bcdUSB = 0x0200,
-        .bDeviceClass = header->device_class,
-        .bDeviceSubClass = header->device_subclass,
-        .bDeviceProtocol = header->device_protocol,
-        .bMaxPacketSize0 = static_cast<uint8_t>(priv.eps.max_packet_size[0]),
-        .idVendor = header->vendor_id,
-        .idProduct = header->product_id,
-        .bcdDevice = header->device_version_bcd,
+        .bcdUSB = dev.desc.bcdUSB,
+        .bDeviceClass = dev.desc.bDeviceClass,
+        .bDeviceSubClass = dev.desc.bDeviceSubClass,
+        .bDeviceProtocol = dev.desc.bDeviceProtocol,
+        .bMaxPacketSize0 = dev.desc.bMaxPacketSize0,
+        .idVendor = dev.desc.idVendor,
+        .idProduct = dev.desc.idProduct,
+        .bcdDevice = dev.desc.bcdDevice,
     };
 
-    usbg_gadget_strs strs = {
-        "42",
-        "SUSE Linux GmbH",
-        "Virtual crashfest"
-    };
+    auto serial = priv.device.strings.getUTF8(0x409, dev.desc.iSerialNumber),
+            product = priv.device.strings.getUTF8(0x409, dev.desc.iProduct),
+            manuf = priv.device.strings.getUTF8(0x409, dev.desc.iManufacturer);
+
+    usbg_gadget_strs strs;
+
+    strncpy(strs.str_ser, serial.c_str(), USBG_MAX_STR_LENGTH);
+    strncpy(strs.str_prd, product.c_str(), USBG_MAX_STR_LENGTH);
+    strncpy(strs.str_mnf, manuf.c_str(), USBG_MAX_STR_LENGTH);
 
     auto e = usbg_error(usbg_create_gadget(priv.usbg.s, "redir0", &attrs, &strs, &priv.usbg.g));
     if(e != USBG_SUCCESS)
-        usbg_perror(e, "usbg_create_gadget");
-    else
     {
-        printf("Got device %.4x:%.4x\n", header->vendor_id, header->product_id);
-        priv.state = UR2PPriv::GADGET_READY;
-
-        e = usbg_error(usbg_create_function(priv.usbg.g, F_FFS, "func0", NULL, &priv.usbg.f));
-        if(e != USBG_SUCCESS)
-            usbg_perror(e, "usbg_create_gadget");
-
-        usbg_config_strs c_strs = {
-                "FUZZ"
-        };
-
-        usbg_create_config(priv.usbg.g, 1, "conf0", NULL, &c_strs, &priv.usbg.c);
-
-        usbg_add_config_function(priv.usbg.c, "confun0", priv.usbg.f);
-
-        e = usbg_error(usbg_enable_gadget(priv.usbg.g, nullptr));
-        if(e != USBG_SUCCESS)
-            fprintf(stderr, "usbg_enable_gadget: %s\n", usbg_strerror(e));
+        usbg_perror(e, "usbg_create_gadget");
+        return false;
     }
-}*/
+
+    /* Add configurations */
+    uint8_t index = 0;
+    for(uint8_t index = 0; index < dev.configs.size(); ++index)
+    {
+        auto &conf = dev.configs[index];
+        auto sConfig = priv.device.strings.getUTF8(0x409, conf.desc.iConfiguration);
+
+        usbg_config_strs c_strs;
+        strncpy(c_strs.configuration, sConfig.c_str(), USBG_MAX_STR_LENGTH);
+
+        char name[7];
+        snprintf(name, sizeof(name), "conf%x", index);
+
+        usbg_config *g_c;
+        usbg_create_config(priv.usbg.g, 1, name, nullptr, &c_strs, &g_c);
+
+        /* Each configuration has exactly one FFS function */
+        usbg_function *g_f;
+        snprintf(name, sizeof(name), "func%x", index);
+        e = usbg_error(usbg_create_function(priv.usbg.g, F_FFS, name, nullptr, &g_f));
+        if(e != USBG_SUCCESS)
+        {
+            usbg_perror(e, "usbg_create_function");
+            return false;
+        }
+
+        usbg_add_config_function(g_c, name, g_f);
+
+        /* Create the USBFunctionFS instance */
+        priv.ffs.push_back({});
+        USBFunctionFs &ffs = priv.ffs.back();
+        if(!ffs.create(std::string{name}))
+        {
+            fprintf(stderr, "Could not create ffs!\n");
+            return false;
+        }
+
+        if(!ffs.fill(dev, conf))
+        {
+            fprintf(stderr, "Could not fill ffs!\n");
+            return false;
+        }
+    }
+
+    e = usbg_error(usbg_enable_gadget(priv.usbg.g, nullptr));
+    if(e != USBG_SUCCESS)
+        fprintf(stderr, "usbg_enable_gadget: %s\n", usbg_strerror(e));
+
+    priv.state = UR2PPriv::GADGET_READY;
+    return true;
+}
 
 /* Parser callbacks */
 #define DECL_PRIV UR2PPriv &priv = *reinterpret_cast<UR2PPriv*>(ppriv)
@@ -302,7 +485,7 @@ void ur2p_device_connect(void *ppriv, struct usb_redir_device_connect_header *)
         .length = sizeof(usb_device_descriptor)
     };
 
-    usbredirparser_send_control_packet(priv.parser.get(), EP0_QUERY_ID, &header, NULL, 0);
+    usbredirparser_send_control_packet(priv.parser.get(), EP_PROCESS, &header, NULL, 0);
 
     priv.state = UR2PPriv::DEV_DESC_QUERIED;
 }
@@ -372,6 +555,7 @@ void ur2p_config_descriptor(UR2PPriv &priv, uint8_t *data, int data_len)
         fprintf(stderr, "Config already seen!\n");
 
     current_conf.desc = desc;
+    current_conf.full_desc.insert(current_conf.full_desc.end(), data, data + data_len);
 
     if(desc.bDescriptorType != USB_DT_CONFIG)
         fprintf(stderr, "Not a config descriptor?\n");
@@ -404,7 +588,7 @@ void ur2p_config_descriptor(UR2PPriv &priv, uint8_t *data, int data_len)
         }
         case USB_DT_ENDPOINT:
         {
-            if(unsigned(data_len) < sizeof(usb_endpoint_descriptor))
+            if(unsigned(data_len) < USB_DT_ENDPOINT_SIZE || unsigned(data_len) > sizeof(usb_endpoint_descriptor))
             {
                 fprintf(stderr, "Invalid descriptor size\n");
                 return;
@@ -417,7 +601,7 @@ void ur2p_config_descriptor(UR2PPriv &priv, uint8_t *data, int data_len)
             }
 
             usb_endpoint_descriptor edesc;
-            memcpy(&edesc, data, sizeof(edesc));
+            memcpy(&edesc, data, size_t(data_len));
 
             /* Add endpoint */
             priv.device.endpoints[epAddrToIndex(edesc.bEndpointAddress)].desc = edesc;
@@ -444,14 +628,13 @@ void ur2p_config_descriptor(UR2PPriv &priv, uint8_t *data, int data_len)
     }
 }
 
-void ur2p_string_descriptor(UR2PPriv &priv, usb_string_descriptor *desc, size_t size)
+void ur2p_string_descriptor(UR2PPriv &priv, usb_string_descriptor *desc, size_t size, uint64_t id)
 {
     if(desc->bDescriptorType != USB_DT_STRING)
         fprintf(stderr, "Not a string descriptor!\n");
 
-    std::u16string string{desc->wData, size - sizeof(usb_string_descriptor)};
-    std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t> conv;
-    printf("%s\n", conv.to_bytes(string).c_str());
+    std::u16string string{reinterpret_cast<char16_t*>(desc->wData), size - offsetof(usb_string_descriptor, wData)};
+    priv.device.strings.strings[uint32_t(id)] = string;
 }
 
 void ur2p_str0_descriptor(UR2PPriv &priv, usb_string_descriptor *desc, size_t size)
@@ -460,7 +643,7 @@ void ur2p_str0_descriptor(UR2PPriv &priv, usb_string_descriptor *desc, size_t si
         fprintf(stderr, "Not a string descriptor!\n");
 
     /* Save available lang ids */
-    size -= sizeof(*desc);
+    size -= offsetof(usb_string_descriptor, wData);
     for(unsigned int i = 0; i < size / 2; ++i)
         priv.device.strings.langs.push_back(desc->wData[i]);
 }
@@ -472,7 +655,7 @@ void ur2p_control_packet(void *ppriv, uint64_t id, struct usb_redir_control_pack
     /* I don't understand the use of signed sizes... */
     assert(data_len >= 0);
 
-    if(id == EP0_QUERY_ID)
+    if(id != EP_FORWARD)
     {
         /* Process input */
         if(priv.state == UR2PPriv::DEV_DESC_QUERIED)
@@ -513,7 +696,7 @@ void ur2p_control_packet(void *ppriv, uint64_t id, struct usb_redir_control_pack
                 return;
             }
 
-            ur2p_string_descriptor(priv, reinterpret_cast<usb_string_descriptor*>(data), size_t(data_len));
+            ur2p_string_descriptor(priv, reinterpret_cast<usb_string_descriptor*>(data), size_t(data_len), id);
         }
 
         /* Generate output */
@@ -531,7 +714,7 @@ void ur2p_control_packet(void *ppriv, uint64_t id, struct usb_redir_control_pack
                 .length = 0xFF
             };
 
-            usbredirparser_send_control_packet(priv.parser.get(), EP0_QUERY_ID, &header, NULL, 0);
+            usbredirparser_send_control_packet(priv.parser.get(), EP_PROCESS, &header, NULL, 0);
 
             priv.state = UR2PPriv::CONF_DESC_QUERIED;
             return;
@@ -550,7 +733,7 @@ void ur2p_control_packet(void *ppriv, uint64_t id, struct usb_redir_control_pack
                 .length = 0xFF
             };
 
-            usbredirparser_send_control_packet(priv.parser.get(), EP0_QUERY_ID, &header, NULL, 0);
+            usbredirparser_send_control_packet(priv.parser.get(), EP_PROCESS, &header, NULL, 0);
 
             priv.state = UR2PPriv::STR0_DESC_QUERIED;
             return;
@@ -592,16 +775,22 @@ void ur2p_control_packet(void *ppriv, uint64_t id, struct usb_redir_control_pack
                 .request = USB_REQ_GET_DESCRIPTOR,
                 .requesttype = USB_DIR_IN,
                 .status = usb_redir_success,
-                .value = (USB_DT_STRING << 8) | stringIndex(string),
+                .value = uint16_t((USB_DT_STRING << 8) | stringIndex(string)),
                 .index = stringLangID(string),
                 .length = 0xFF
             };
 
-            usbredirparser_send_control_packet(priv.parser.get(), EP0_QUERY_ID, &header, NULL, 0);
+            usbredirparser_send_control_packet(priv.parser.get(), string, &header, NULL, 0);
 
             priv.state = UR2PPriv::STR_DESC_QUERIED;
             return;
         }
+
+        /* We got everything! Let's configure and boot up the gadget */
+        if(!gadget_init(priv))
+            keep_running = false;
+
+        return;
     }
 }
 

@@ -1,11 +1,12 @@
 #ifndef USBDEVICE_H
 #define USBDEVICE_H
 
+#include <codecvt>
 #include <map>
 #include <string>
 #include <vector>
 
-#include "usb.h"
+#include <linux/usb/ch9.h>
 
 constexpr size_t epAddrToIndex(uint8_t a)
 {
@@ -41,12 +42,25 @@ struct USBInterface {
 struct USBConfiguration {
     usb_config_descriptor desc;
     std::vector<USBInterface> interfaces;
+    /* The whole blob receviced, containing IFs, EPs
+     * and unrecognized descriptors */
+    std::vector<uint8_t> full_desc;
 };
 
 struct USBStrings {
     std::vector<uint16_t> langs;
     // Use makeString as index
     std::map<uint32_t, std::u16string> strings;
+
+    std::string getUTF8(uint16_t lang, uint8_t index) const
+    {
+        auto key = makeString(lang, index);
+        if(index == 0 || strings.count(key) == 0)
+            return {};
+
+        std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t> conv;
+        return conv.to_bytes(strings.at(key));
+    }
 };
 
 struct USBDevice {
