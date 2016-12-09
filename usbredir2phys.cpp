@@ -195,6 +195,7 @@ public:
 
         std::vector<uint8_t> request;
 
+        /* TODO: Same descriptors used for FS and HS (*2) */
         uint32_t length = sizeof(usb_functionfs_descs_head_v2)
                           + sizeof(uint32_t) * 2
                           + config.full_desc.size() * 2;
@@ -895,7 +896,7 @@ int main(int argc, char **argv)
 
     usbredirparser_caps_set_cap(caps, usb_redir_cap_connect_device_version);
     usbredirparser_caps_set_cap(caps, usb_redir_cap_ep_info_max_packet_size);
-    // fdo#
+    // fdo#99015
     //usbredirparser_caps_set_cap(caps, usb_redir_cap_64bits_ids);
 
     usbredirparser_init(parser, "UR2P 0.-1", caps, USB_REDIR_CAPS_SIZE, 0);
