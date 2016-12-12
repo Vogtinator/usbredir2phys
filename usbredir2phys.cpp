@@ -162,7 +162,7 @@ public:
 
         path = tmpname;
 
-        std::string command = std::string("mount -t functionfs " + name + " " + path);
+        std::string command = std::string("mount -t functionfs '" + name + "' " + path);
         if(system(command.c_str()) == 0)
         {
             dirfd = open(path.c_str(), O_RDONLY | O_DIRECTORY);
