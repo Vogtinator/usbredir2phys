@@ -242,7 +242,7 @@ public:
         auto e = write(ep0, request.data(), request.size());
         if(e != ssize_t(request.size()))
         {
-            perror("FFS EP0 descs write");
+            perror("FFS EP0 descs write (Kernel too old?)");
             return false;
         }
 
@@ -274,7 +274,124 @@ public:
             return false;
         }
 
+        /* FFS does not use the EP address, it uses consecutive numbers
+         * based on the descriptors we supplied...
+         * FFS, FFS! */
+
+        unsigned int index = 1;
+        for(auto&& intf : config.interfaces)
+            for(auto&& epAddr : intf.endpoints)
+            {
+                if(endpoints.find(epAddr) != endpoints.end())
+                {
+                    perror("Duplicate EP address?");
+                    return false;
+                }
+
+                auto epfd = openEP(index);
+                if(epfd == -1)
+                {
+                    perror("FFS EP open");
+                    return false;
+                }
+
+                endpoints[epAddr] = epfd;
+
+                index += 1;
+            }
+
         return true;
+    }
+
+    /* For use with select. */
+    void fillFDSet(fd_set *set, int *highest)
+    {
+        for(auto &&ep : endpoints)
+        {
+            FD_SET(ep.second, set);
+            if(ep.second > *highest)
+                *highest = ep.second;
+        }
+    }
+
+    bool handleEP0Data(int fd)
+    {
+        /* Read events until EOF */
+        for(;;)
+        {
+            usb_functionfs_event event;
+            auto r = read(fd, &event, sizeof(event));
+            if(r < 0)
+            {
+                perror("EP0 READ");
+                return false;
+            }
+            else if(r == 0)
+                return true; // EOF
+            else if(size_t(r) < sizeof(event))
+            {
+                perror("EP0 partial read");
+                return false;
+            }
+
+            /* Handle event */
+            switch(event.type)
+            {
+            case FUNCTIONFS_BIND:
+            case FUNCTIONFS_UNBIND:
+            case FUNCTIONFS_ENABLE:
+            case FUNCTIONFS_DISABLE:
+                break;
+
+            case FUNCTIONFS_SETUP:
+                // TODO!
+                break;
+
+            case FUNCTIONFS_SUSPEND:
+            case FUNCTIONFS_RESUME:
+                printf("Suspend/Resume: TODO");
+                break;
+
+            default:
+                fprintf(stderr, "Unknown EP0 event %d\n", event.type);
+                // no return false here
+                break;
+            }
+        }
+    }
+
+    bool handleEPXData(uint8_t ep, int fd)
+    {
+        uint8_t buf[1024];
+        auto r = read(fd, buf, sizeof(buf));
+        if(r < 0 && errno != EBADMSG)
+        {
+            perror("EPX READ");
+            return false;
+        }
+
+        write(2, "EPX: ", 4);
+        write(2, buf, r);
+
+        return true;
+    }
+
+    bool handleDataAvailable(fd_set *set)
+    {
+        bool ret = true;
+
+        for(auto &&ep : endpoints)
+        {
+            if(!FD_ISSET(ep.second, set))
+                continue;
+
+            if(ep.first == 0)
+                ret = ret && handleEP0Data(ep.second);
+            else
+                ret = ret && handleEPXData(ep.first, ep.second);
+        }
+
+        return ret;
     }
 
 private:
@@ -311,19 +428,12 @@ struct PrivUSBG {
 };
 
 struct UR2PPriv {
-    ~UR2PPriv() {
-        // Need to free up functionfs references first
-        ffs.clear();
-    }
-
     PrivUSBG usbg;
     TCPConnection con;
     scope_ptr<usbredirparser> parser{nullptr, usbredirparser_destroy};
-    /* One per configuration */
-    std::vector<USBFunctionFs> ffs;
     USBDevice device;
 
-    // To be requested
+    /* To be requested */
     std::vector<uint32_t> missing_strings;
 
     enum {
@@ -334,6 +444,10 @@ struct UR2PPriv {
         STR_DESC_QUERIED,
         GADGET_READY
     } state;
+
+    /* One per configuration.
+     * Is the last member as it needs to be cleaned up first */
+    std::vector<USBFunctionFs> ffs;
 };
 
 /* Set to false in the signal handler. */
@@ -491,20 +605,9 @@ void ur2p_device_connect(void *ppriv, struct usb_redir_device_connect_header *)
     priv.state = UR2PPriv::DEV_DESC_QUERIED;
 }
 
-void ur2p_device_disconnect(void *)
-{
-    printf("device disconnected");
-}
-
-void ur2p_interface_info(void *, struct usb_redir_interface_info_header *)
-{
-    printf("Got interface info\n");
-}
-
-void ur2p_ep_info(void *, struct usb_redir_ep_info_header *)
-{
-    printf("Got endpoint info\n");
-}
+void ur2p_device_disconnect(void *) {}
+void ur2p_interface_info(void *, struct usb_redir_interface_info_header *) {}
+void ur2p_ep_info(void *, struct usb_redir_ep_info_header *) {}
 
 void ur2p_configuration_status(void *ppriv, uint64_t id, struct usb_redir_configuration_status_header *config_status)
 {
@@ -613,6 +716,11 @@ void ur2p_config_descriptor(UR2PPriv &priv, uint8_t *data, int data_len)
             printf("\t`Endpoint 0x%.2x\n", edesc.bEndpointAddress);
             break;
         }
+        case 0x21:
+        {
+            printf("\t`HID descriptor\n");
+            break;
+        }
         default:
             fprintf(stderr, "Unhandled case 0x%.2x\n", d_type->bDescriptorType);
             break;
@@ -712,7 +820,7 @@ void ur2p_control_packet(void *ppriv, uint64_t id, struct usb_redir_control_pack
                 .status = usb_redir_success,
                 .value = (USB_DT_CONFIG << 8) | USB_RECIP_DEVICE,
                 .index = uint16_t(priv.device.configs.size()),
-                .length = 0xFF
+                .length = USB_MAX_CTRL_SIZE
             };
 
             usbredirparser_send_control_packet(priv.parser.get(), EP_PROCESS, &header, NULL, 0);
@@ -731,7 +839,7 @@ void ur2p_control_packet(void *ppriv, uint64_t id, struct usb_redir_control_pack
                 .status = usb_redir_success,
                 .value = (USB_DT_STRING << 8) | 0,
                 .index = 0,
-                .length = 0xFF
+                .length = USB_MAX_CTRL_SIZE
             };
 
             usbredirparser_send_control_packet(priv.parser.get(), EP_PROCESS, &header, NULL, 0);
@@ -778,7 +886,7 @@ void ur2p_control_packet(void *ppriv, uint64_t id, struct usb_redir_control_pack
                 .status = usb_redir_success,
                 .value = uint16_t((USB_DT_STRING << 8) | stringIndex(string)),
                 .index = stringLangID(string),
-                .length = 0xFF
+                .length = USB_MAX_CTRL_SIZE
             };
 
             usbredirparser_send_control_packet(priv.parser.get(), string, &header, NULL, 0);
@@ -913,17 +1021,28 @@ int main(int argc, char **argv)
         FD_ZERO(&rfds);
         FD_ZERO(&wfds);
 
+        int highest = priv.con.fd;
+
         FD_SET(priv.con.fd, &rfds);
         if(usbredirparser_has_data_to_write(parser))
             FD_SET(priv.con.fd, &wfds);
 
-        if(select(priv.con.fd + 1, &rfds, &wfds, NULL, NULL) == -1)
+        for(auto && ffs : priv.ffs)
+            ffs.fillFDSet(&rfds, &highest);
+
+        if(select(highest + 1, &rfds, &wfds, NULL, NULL) == -1)
         {
             if(errno == EINTR)
                 continue;
 
             perror("select");
             break;
+        }
+
+        for(auto && ffs : priv.ffs)
+        {
+            if(!ffs.handleDataAvailable(&rfds))
+                keep_running = false;
         }
 
         if(FD_ISSET(priv.con.fd, &rfds) && usbredirparser_do_read(parser) != 0)

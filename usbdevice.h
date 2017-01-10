@@ -8,6 +8,12 @@
 
 #include <linux/usb/ch9.h>
 
+/* Although the max len supported is 65536,
+ * libusb rejects anything over 4096 as "Windows does not support it".
+ * *facedesk*
+ */
+#define USB_MAX_CTRL_SIZE 4096
+
 constexpr size_t epAddrToIndex(uint8_t a)
 {
     return (a & 0x80 >> 3) | (a & 0xF);
