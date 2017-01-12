@@ -1,8 +1,12 @@
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <fcntl.h>
@@ -135,12 +139,25 @@ public:
         : urp(urp) {}
 
     USBFunctionFs(const USBFunctionFs &other) = delete;
-    USBFunctionFs(USBFunctionFs&&) = default;
-    USBFunctionFs& operator = (USBFunctionFs&&) = default;
+
+    /* This is racy, but USBFunctionFs objects are only moved around
+     * before the threads are started */
+    USBFunctionFs(USBFunctionFs&& other)
+        : stop_threads(other.stop_threads.load()),
+          waiting_for_data(other.waiting_for_data.load())
+    {
+        assert(ep_threads.empty());
+    }
+
     ~USBFunctionFs()
     {
         if(path.empty())
             return;
+
+        stop_threads = true;
+        for(auto &thread : ep_threads)
+            if(thread.joinable())
+                thread.join();
 
         if(dirfd >= 0)
             close(dirfd);
@@ -178,16 +195,16 @@ public:
         return false;
     }
 
-    int openEP(uint8_t id)
+    int openEP(uint8_t id, bool nonblock)
     {
         char name[5];
         snprintf(name, sizeof(name), "ep%x", id);
-        return openat(dirfd, name, O_RDWR | O_NONBLOCK);
+        return openat(dirfd, name, O_RDWR | (nonblock ? O_NONBLOCK : 0));
     }
 
     bool writePacketEP(uint8_t ep, const uint8_t *data, size_t size)
     {
-        auto &&ep_fd = endpoints.find(ep & 0x7f);
+        auto &&ep_fd = endpoints.find(ep);
         if(ep_fd == endpoints.end())
             return false;
 
@@ -196,16 +213,78 @@ public:
 
     bool readPacketEP(uint8_t ep, uint8_t *data, size_t size)
     {
-        auto &&ep_fd = endpoints.find(ep & 0x7f);
+        auto &&ep_fd = endpoints.find(ep);
         if(ep_fd == endpoints.end())
             return false;
 
         return read(ep_fd->second, data, size) == ssize_t(size);
     }
 
+    bool handleEPXData(uint8_t ep, int fd)
+    {
+        uint8_t buf[1024];
+        auto r = read(fd, buf, sizeof(buf));
+        if(r == 0 || (r < 0 && errno == EAGAIN))
+            return true; // EOF
+        else if(r < 0)
+        {
+            if(errno == EBADMSG)
+            {
+                fprintf(stderr, "Bad message\n");
+                ioctl(fd, FUNCTIONFS_CLEAR_HALT);
+                return true;
+            }
+
+            perror("EPX READ");
+            return false;
+        }
+
+        printf("Host: Received Bulk Packet(%ld bytes)\n", r);
+
+        usb_redir_bulk_packet_header header = {
+            .endpoint = ep,
+            .status = usb_redir_success,
+            .length = uint16_t(r),
+            .stream_id = 0,
+            .length_high = uint16_t(r >> 16),
+        };
+
+        usbredirparser_send_bulk_packet(urp, EP_FORWARD, &header, buf, r);
+
+        waiting_for_data = true;
+
+        // Main thread could hang inside select
+        usbredirparser_do_write(urp);
+
+        return true;
+    }
+
+    void makeEPXRequest(uint8_t ep, uint16_t max_size)
+    {
+        do
+        {
+            using namespace std::chrono_literals;
+            std::this_thread::sleep_for(50ms);
+        }
+        while(waiting_for_data);
+
+        usb_redir_bulk_packet_header header = {
+            .endpoint = ep,
+            .status = usb_redir_success,
+            .length = max_size,
+            .stream_id = EP_FORWARD,
+            .length_high = 0
+        };
+
+        usbredirparser_send_bulk_packet(urp, EP_FORWARD, &header, nullptr, 0);
+
+        // Main thread could hang inside select
+        usbredirparser_do_write(urp);
+    }
+
     bool fill(const USBDevice &dev, const USBConfiguration &config)
     {
-        int ep0 = openEP(0);
+        int ep0 = openEP(0, true);
 
         if(ep0 == -1)
         {
@@ -213,7 +292,7 @@ public:
             return false;
         }
 
-        endpoints[0] = ep0;
+        endpoints[0x80] = ep0;
 
         std::vector<uint8_t> request;
 
@@ -296,8 +375,6 @@ public:
             return false;
         }
 
-        /* FFS does not use the EP address directly, only the endpoint number */
-
         for(auto&& intf : config.interfaces)
             for(auto&& epAddr : intf.endpoints)
             {
@@ -307,7 +384,8 @@ public:
                     return false;
                 }
 
-                auto epfd = openEP(epAddr & USB_ENDPOINT_NUMBER_MASK);
+                // FFS does not use the EP address directly, only the endpoint number
+                auto epfd = openEP(epAddr & USB_ENDPOINT_NUMBER_MASK, false);
                 if(epfd == -1)
                 {
                     perror("FFS EP open");
@@ -315,6 +393,46 @@ public:
                 }
 
                 endpoints[epAddr] = epfd;
+
+                /* Create read threads for all OUT endpoints */
+                if((epAddr & USB_DIR_IN) == 0)
+                {
+                    /* Although 'this' is captured by value it is still a pointer.
+                     * However, the threads cannot outlive this object, so it is safe. */
+                    auto ep_thread = [=] ()
+                    {
+                        while(!stop_threads.load())
+                            handleEPXData(epAddr, epfd);
+                    };
+
+                    ep_threads.emplace_back(ep_thread);
+                }
+                else
+                {
+                    auto &ep_desc = dev.endpoints[epAddrToIndex(epAddr)].desc;
+
+                    switch(ep_desc.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK)
+                    {
+                    case USB_ENDPOINT_XFER_INT:
+                    {
+                        usb_redir_start_interrupt_receiving_header header = {
+                            .endpoint = epAddr,
+                        };
+                        usbredirparser_send_start_interrupt_receiving(urp, EP_PROCESS, &header);
+                        break;
+                    }
+                    case USB_ENDPOINT_XFER_BULK:
+                    {
+                       auto ep_thread = [=] ()
+                        {
+                            while(!stop_threads.load())
+                                makeEPXRequest(epAddr, 0x7FFF /*ep_desc.wMaxPacketSize*/);
+                        };
+
+                        ep_threads.emplace_back(ep_thread);
+                    }
+                    }
+                }
             }
 
         return true;
@@ -323,16 +441,9 @@ public:
     /* For use with select. */
     void fillFDSet(fd_set *set_read, int *highest)
     {
-        for(auto &&ep : endpoints)
-        {
-            // Only OUT endpoints need to be read
-            if(ep.first & 0x80)
-                continue;
-
-            FD_SET(ep.second, set_read);
-            if(ep.second > *highest)
-                *highest = ep.second;
-        }
+        FD_SET(endpoints[0x80], set_read);
+        if(endpoints[0x80] > *highest)
+            *highest = endpoints[0x80];
     }
 
     bool handleEP0Data(int fd)
@@ -381,7 +492,7 @@ public:
                     .length = event.u.setup.wLength
                 };
 
-                if((event.u.setup.bRequestType & 0x80) == 0)
+                if((event.u.setup.bRequestType & USB_DIR_IN) == 0)
                 {
                     if(header.length > USB_MAX_CTRL_SIZE)
                     {
@@ -390,7 +501,7 @@ public:
                     }
 
                     uint8_t data[USB_MAX_CTRL_SIZE];
-                    if(!readPacketEP(header.endpoint, data, header.length))
+                    if(!readPacketEP(0, data, header.length))
                         perror("Warn: packet read");
 
                     usbredirparser_send_control_packet(urp, EP_FORWARD, &header, data, header.length);
@@ -418,54 +529,12 @@ public:
         return true;
     }
 
-    bool handleEPXData(uint8_t ep, int fd)
-    {
-        uint8_t buf[1024];
-        auto r = read(fd, buf, sizeof(buf));
-        if(r == 0 || (r < 0 && errno == EAGAIN))
-            return true; // EOF
-        else if(r < 0)
-        {
-            if(errno == EBADMSG)
-            {
-                fprintf(stderr, "Bad message\n");
-                ioctl(fd, FUNCTIONFS_CLEAR_HALT);
-                return true;
-            }
-
-            perror("EPX READ");
-            return false;
-        }
-
-        usb_redir_bulk_packet_header header = {
-            .endpoint = ep,
-            .status = usb_redir_success,
-            .length = uint16_t(r),
-            .stream_id = 0,
-            .length_high = uint16_t(r >> 16),
-        };
-
-        usbredirparser_send_bulk_packet(urp, EP_FORWARD, &header, buf, r);
-
-        return true;
-    }
-
     bool handleDataAvailable(fd_set *set)
     {
-        bool ret = true;
+        if(!FD_ISSET(endpoints[0x80], set))
+            return true;
 
-        for(auto &&ep : endpoints)
-        {
-            if(!FD_ISSET(ep.second, set))
-                continue;
-
-            if(ep.first == 0)
-                ret = ret && handleEP0Data(ep.second);
-            else
-                ret = ret && handleEPXData(ep.first, ep.second);
-        }
-
-        return ret;
+        return handleEP0Data(endpoints[0x80]);
     }
 
     /* After each event, a roundtrip over usbredir is required.
@@ -480,7 +549,9 @@ private:
     int dirfd = -1;
     usbredirparser *urp;
     std::map<uint8_t, int> endpoints;
-    bool waiting_for_data = false;
+
+    std::atomic_bool stop_threads{false}, waiting_for_data{false};
+    std::vector<std::thread> ep_threads;
 };
 
 template<typename... Args>
@@ -608,7 +679,7 @@ bool gadget_init(UR2PPriv &priv)
         usbg_add_config_function(g_c, name, g_f);
 
         /* Create the USBFunctionFS instance */
-        priv.ffs.push_back({priv.parser.get()});
+        priv.ffs.emplace_back(priv.parser.get());
         USBFunctionFs &ffs = priv.ffs.back();
         if(!ffs.create(std::string{name}))
         {
@@ -696,7 +767,7 @@ void ur2p_configuration_status(void *ppriv, uint64_t id, struct usb_redir_config
 void ur2p_alt_setting_status(void *ppriv, uint64_t id, struct usb_redir_alt_setting_status_header *alt_setting_status) {}
 void ur2p_iso_stream_status(void *ppriv, uint64_t id, struct usb_redir_iso_stream_status_header *iso_stream_status) {}
 void ur2p_interrupt_receiving_status(void *ppriv, uint64_t id, struct usb_redir_interrupt_receiving_status_header *interrupt_receiving_status) {}
-void ur2p_bulk_streams_status(void *ppriv, uint64_t id, struct usb_redir_bulk_streams_status_header *bulk_streams_status) {}
+void ur2p_bulk_receiving_status(void *ppriv, uint64_t id, struct usb_redir_bulk_receiving_status_header *bulk_streams_status) {}
 
 void ur2p_device_descriptor(UR2PPriv &priv, usb_device_descriptor *desc)
 {
@@ -1015,6 +1086,42 @@ template <>
         usbredirparser_free_packet_data(priv.parser.get(), data);
 }
 
+template <>
+    void ur2p_packet_handler<usb_redir_interrupt_packet_header>(void *ppriv, uint64_t id, usb_redir_interrupt_packet_header *packet, uint8_t *data, int data_len)
+{
+    DECL_PRIV;
+
+    /* Forward packets */
+    if(data_len > 0 && (packet->endpoint & USB_DIR_IN))
+    {
+        if(!priv.ffs[0].writePacketEP(packet->endpoint, data, data_len))
+            fprintf(stderr, "Packet send failed\n");
+    }
+
+    if(data)
+        usbredirparser_free_packet_data(priv.parser.get(), data);
+}
+
+void *ur2p_alloc_lock()
+{
+    return new std::mutex;
+}
+
+void ur2p_lock(void *lock)
+{
+    reinterpret_cast<std::mutex*>(lock)->lock();
+}
+
+void ur2p_unlock(void *lock)
+{
+    reinterpret_cast<std::mutex*>(lock)->unlock();
+}
+
+void ur2p_free_lock(void *lock)
+{
+    delete reinterpret_cast<std::mutex*>(lock);
+}
+
 void ur2p_hello(void *, struct usb_redir_hello_header *header)
 {
     printf("Connected to %.64s.\n", header->version);
@@ -1091,16 +1198,23 @@ int main(int argc, char **argv)
     parser->alt_setting_status_func = ur2p_alt_setting_status;
     parser->iso_stream_status_func = ur2p_iso_stream_status;
     parser->interrupt_receiving_status_func = ur2p_interrupt_receiving_status;
-    parser->bulk_streams_status_func = ur2p_bulk_streams_status;
+    parser->bulk_receiving_status_func= ur2p_bulk_receiving_status;
     parser->control_packet_func = ur2p_packet_handler<usb_redir_control_packet_header>;
     parser->bulk_packet_func = ur2p_packet_handler<usb_redir_bulk_packet_header>;
     parser->iso_packet_func = ur2p_packet_handler<usb_redir_iso_packet_header>;
+    parser->interrupt_packet_func = ur2p_packet_handler<usb_redir_interrupt_packet_header>;
+    parser->alloc_lock_func = ur2p_alloc_lock;
+    parser->lock_func = ur2p_lock;
+    parser->unlock_func = ur2p_unlock;
+    parser->free_lock_func = ur2p_free_lock;
     parser->hello_func = ur2p_hello;
 
     uint32_t caps[USB_REDIR_CAPS_SIZE] = {0};
 
     // fdo#99015
     //usbredirparser_caps_set_cap(caps, usb_redir_cap_64bits_ids);
+
+    usbredirparser_caps_set_cap(caps, usb_redir_cap_bulk_receiving);
 
     usbredirparser_init(parser, "UR2P 0.-1", caps, USB_REDIR_CAPS_SIZE, 0);
 
