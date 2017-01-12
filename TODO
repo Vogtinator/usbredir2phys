@@ -1,3 +1,2 @@
-USBFunctionFS creates endpoints, but doesn't do anything with it
-- Use fd_set and such
-- Handle all requests, maybe requires a work queue
+- Refactor USBFunctionFS out of main .cpp file
+- Handle different configurations

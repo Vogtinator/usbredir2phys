@@ -2,6 +2,7 @@
 #define USBDEVICE_H
 
 #include <codecvt>
+#include <locale>
 #include <map>
 #include <string>
 #include <vector>
