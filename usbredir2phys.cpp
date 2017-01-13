@@ -161,7 +161,7 @@ class USBFunctionFs
     };
 
 public:
-    USBFunctionFs(usbredirparser *urp)
+    explicit USBFunctionFs(usbredirparser *urp)
         : urp(urp)
     {}
 
@@ -700,7 +700,6 @@ bool gadget_init(UR2PPriv &priv)
     }
 
     /* Add configurations */
-    uint8_t index = 0;
     for(uint8_t index = 0; index < dev.configs.size(); ++index)
     {
         auto &conf = dev.configs[index];
