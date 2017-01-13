@@ -29,12 +29,20 @@ extern "C" {
 #include "usbdevice.h"
 
 /* Various constants */
-const constexpr uint32_t EP_FORWARD = 0x71FEBEEF,
-                         EP_PROCESS = 0xDEADBEEF;
+const constexpr uint32_t EP_FORWARD = 0x71FEBEEF, // Always forward
+                         EP_PROCESS = 0xDEADBEEF; // Targeted at ur2p itself
 
 /* Simple RAII deleter */
 template<typename T>
 using scope_ptr = std::unique_ptr<T, void(*)(T*)>;
+
+template<typename... Args>
+    void debugPrintf(Args... args)
+{
+    #ifndef NDEBUG
+        printf(args...);
+    #endif
+}
 
 /* Helper for RAII */
 class TCPConnection {
@@ -133,20 +141,37 @@ void appendToVector(std::vector<uint8_t> &v, const T &data)
     memcpy(v.data() + v.size() - sizeof(T), &data, sizeof(T));
 }
 
-class USBFunctionFs {
+class USBFunctionFs
+{
+    struct EPData
+    {
+        EPData() = default;
+
+        /* This is racy, but EPData objects are only moved around
+         * before the threads are started */
+        EPData(EPData&& other)
+            : thread(std::move(other.thread)),
+              waiting_for_answer{false},
+              fd{other.fd}
+        {}
+
+        std::thread thread;
+        std::atomic_bool waiting_for_answer{false};
+        int fd;
+    };
+
 public:
     USBFunctionFs(usbredirparser *urp)
-        : urp(urp) {}
+        : urp(urp)
+    {}
 
     USBFunctionFs(const USBFunctionFs &other) = delete;
 
-    /* This is racy, but USBFunctionFs objects are only moved around
-     * before the threads are started */
     USBFunctionFs(USBFunctionFs&& other)
         : stop_threads(other.stop_threads.load()),
-          waiting_for_data(other.waiting_for_data.load())
+          endpoints(std::move(other.endpoints))
     {
-        assert(ep_threads.empty());
+        assert(endpoints.empty());
     }
 
     ~USBFunctionFs()
@@ -155,15 +180,17 @@ public:
             return;
 
         stop_threads = true;
-        for(auto &thread : ep_threads)
-            if(thread.joinable())
-                thread.join();
 
         if(dirfd >= 0)
             close(dirfd);
 
-        for(auto fd : endpoints)
-            close(fd.second);
+        for(auto & fd : endpoints)
+        {
+            if(fd.second.thread.joinable())
+                fd.second.thread.join();
+
+            close(fd.second.fd);
+        }
 
         std::string command = std::string("umount " + path);
         system(command.c_str());
@@ -204,26 +231,35 @@ public:
 
     bool writePacketEP(uint8_t ep, const uint8_t *data, size_t size)
     {
-        auto &&ep_fd = endpoints.find(ep);
-        if(ep_fd == endpoints.end())
+        auto &&ep_data = endpoints.find(ep);
+        if(ep_data == endpoints.end())
             return false;
 
-        return write(ep_fd->second, data, size) == ssize_t(size);
+        return write(ep_data->second.fd, data, size) == ssize_t(size);
     }
 
     bool readPacketEP(uint8_t ep, uint8_t *data, size_t size)
     {
-        auto &&ep_fd = endpoints.find(ep);
-        if(ep_fd == endpoints.end())
+        auto &&ep_data = endpoints.find(ep);
+        if(ep_data == endpoints.end())
             return false;
 
-        return read(ep_fd->second, data, size) == ssize_t(size);
+        return read(ep_data->second.fd, data, size) == ssize_t(size);
     }
 
-    bool handleEPXData(uint8_t ep, int fd)
+    bool handleEPXData(uint8_t ep, EPData &ep_data)
     {
+        while(ep_data.waiting_for_answer)
+        {
+            using namespace std::chrono_literals;
+            std::this_thread::sleep_for(5ms);
+
+            if(stop_threads)
+                return true;
+        }
+
         uint8_t buf[1024];
-        auto r = read(fd, buf, sizeof(buf));
+        auto r = read(ep_data.fd, buf, sizeof(buf));
         if(r == 0 || (r < 0 && errno == EAGAIN))
             return true; // EOF
         else if(r < 0)
@@ -231,7 +267,7 @@ public:
             if(errno == EBADMSG)
             {
                 fprintf(stderr, "Bad message\n");
-                ioctl(fd, FUNCTIONFS_CLEAR_HALT);
+                ioctl(ep_data.fd, FUNCTIONFS_CLEAR_HALT);
                 return true;
             }
 
@@ -239,7 +275,7 @@ public:
             return false;
         }
 
-        printf("Host: Received Bulk Packet(%ld bytes)\n", r);
+        debugPrintf("Host: Received Bulk Packet(%ld bytes)\n", r);
 
         usb_redir_bulk_packet_header header = {
             .endpoint = ep,
@@ -251,7 +287,7 @@ public:
 
         usbredirparser_send_bulk_packet(urp, EP_FORWARD, &header, buf, r);
 
-        waiting_for_data = true;
+        ep_data.waiting_for_answer = true;
 
         // Main thread could hang inside select
         usbredirparser_do_write(urp);
@@ -259,24 +295,28 @@ public:
         return true;
     }
 
-    void makeEPXRequest(uint8_t ep, uint16_t max_size)
+    void pollEPX(uint8_t ep, uint32_t max_size, EPData &ep_data)
     {
-        do
+        while(ep_data.waiting_for_answer)
         {
             using namespace std::chrono_literals;
-            std::this_thread::sleep_for(50ms);
+            std::this_thread::sleep_for(5ms);
+
+            if(stop_threads)
+                return;
         }
-        while(waiting_for_data);
 
         usb_redir_bulk_packet_header header = {
             .endpoint = ep,
             .status = usb_redir_success,
-            .length = max_size,
+            .length = uint16_t(max_size),
             .stream_id = EP_FORWARD,
-            .length_high = 0
+            .length_high = uint16_t(max_size >> 16),
         };
 
         usbredirparser_send_bulk_packet(urp, EP_FORWARD, &header, nullptr, 0);
+
+        ep_data.waiting_for_answer = true;
 
         // Main thread could hang inside select
         usbredirparser_do_write(urp);
@@ -292,7 +332,7 @@ public:
             return false;
         }
 
-        endpoints[0x80] = ep0;
+        endpoints[0x80].fd = ep0;
 
         std::vector<uint8_t> request;
 
@@ -392,48 +432,62 @@ public:
                     return false;
                 }
 
-                endpoints[epAddr] = epfd;
+                this->endpoints[epAddr].fd = epfd;
+            }
 
-                /* Create read threads for all OUT endpoints */
-                if((epAddr & USB_DIR_IN) == 0)
+        for(auto &&ep : endpoints)
+        {
+            auto &epAddr = ep.first;
+            auto &ep_data = ep.second;
+
+            // ep0 is handled separately
+            if(epAddr == 0x80)
+                continue;
+
+            /* Create read threads for all OUT endpoints.
+             * Normally this could be handled in the main thread,
+             * but despite O_NONBLOCK is set it blocks sometimes... */
+            if((epAddr & USB_DIR_IN) == 0)
+            {
+                /* Although 'this' is captured by value it is still a pointer.
+                 * However, the threads cannot outlive this object, so it is safe. */
+                auto ep_thread = [this, epAddr, &ep_data] ()
                 {
-                    /* Although 'this' is captured by value it is still a pointer.
-                     * However, the threads cannot outlive this object, so it is safe. */
-                    auto ep_thread = [=] ()
-                    {
-                        while(!stop_threads.load())
-                            handleEPXData(epAddr, epfd);
+                    while(!this->stop_threads.load())
+                        handleEPXData(epAddr, ep_data);
+                };
+
+                ep_data.thread = std::thread{ep_thread};
+            }
+            else
+            {
+                auto &ep_desc = dev.endpoints[epAddrToIndex(epAddr)].desc;
+
+                switch(ep_desc.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK)
+                {
+                case USB_ENDPOINT_XFER_INT:
+                {
+                    usb_redir_start_interrupt_receiving_header header = {
+                        .endpoint = epAddr,
                     };
 
-                    ep_threads.emplace_back(ep_thread);
+                    usbredirparser_send_start_interrupt_receiving(urp, EP_PROCESS, &header);
+                    break;
                 }
-                else
+                case USB_ENDPOINT_XFER_BULK:
                 {
-                    auto &ep_desc = dev.endpoints[epAddrToIndex(epAddr)].desc;
+                    /* Poll continuously */
+                    auto ep_thread = [this, ep_desc, &ep_data, epAddr] ()
+                    {
+                        while(!this->stop_threads.load())
+                            pollEPX(epAddr, ep_desc.wMaxPacketSize, ep_data);
+                    };
 
-                    switch(ep_desc.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK)
-                    {
-                    case USB_ENDPOINT_XFER_INT:
-                    {
-                        usb_redir_start_interrupt_receiving_header header = {
-                            .endpoint = epAddr,
-                        };
-                        usbredirparser_send_start_interrupt_receiving(urp, EP_PROCESS, &header);
-                        break;
-                    }
-                    case USB_ENDPOINT_XFER_BULK:
-                    {
-                       auto ep_thread = [=] ()
-                        {
-                            while(!stop_threads.load())
-                                makeEPXRequest(epAddr, 0x7FFF /*ep_desc.wMaxPacketSize*/);
-                        };
-
-                        ep_threads.emplace_back(ep_thread);
-                    }
-                    }
+                    ep_data.thread = std::thread{ep_thread};
+                }
                 }
             }
+        }
 
         return true;
     }
@@ -441,18 +495,23 @@ public:
     /* For use with select. */
     void fillFDSet(fd_set *set_read, int *highest)
     {
-        FD_SET(endpoints[0x80], set_read);
-        if(endpoints[0x80] > *highest)
-            *highest = endpoints[0x80];
+        FD_SET(endpoints[0x80].fd, set_read);
+        if(endpoints[0x80].fd > *highest)
+            *highest = endpoints[0x80].fd;
     }
 
-    bool handleEP0Data(int fd)
+    bool handleEP0Data(const fd_set *set)
     {
+        auto &ep_data = endpoints[0x80];
+
+        if(!FD_ISSET(ep_data.fd, set))
+            return true;
+
         /* Read events until EOF or reponse needed */
-        while(!waiting_for_data)
+        while(!ep_data.waiting_for_answer)
         {
             usb_functionfs_event event;
-            auto r = read(fd, &event, sizeof(event));
+            auto r = read(ep_data.fd, &event, sizeof(event));
             if(r == 0 || (r < 0 && errno == EAGAIN))
                 return true; // EOF
             else if(r < 0)
@@ -474,14 +533,14 @@ public:
                 break;
 
             case FUNCTIONFS_ENABLE:
-                printf("ENABLE\n"); break;
+                debugPrintf("ENABLE\n"); break;
             case FUNCTIONFS_DISABLE:
-                printf("DISABLE\n"); break;
+                debugPrintf("DISABLE\n"); break;
 
             case FUNCTIONFS_SETUP:
             {
-                printf("Host: Received control packet\n");
-                /* Send as control packet */
+                debugPrintf("Host: Received control packet\n");
+
                 usb_redir_control_packet_header header = {
                     .endpoint = uint8_t(event.u.setup.bRequestType & USB_DIR_IN),
                     .request = event.u.setup.bRequest,
@@ -509,14 +568,14 @@ public:
                 else
                     usbredirparser_send_control_packet(urp, EP_FORWARD, &header, nullptr, 0);
 
-                waiting_for_data = true;
+                ep_data.waiting_for_answer = true;
 
                 return true;
             }
 
             case FUNCTIONFS_SUSPEND:
             case FUNCTIONFS_RESUME:
-                printf("Suspend/Resume: TODO\n");
+                debugPrintf("Suspend/Resume: TODO\n");
                 break;
 
             default:
@@ -529,29 +588,19 @@ public:
         return true;
     }
 
-    bool handleDataAvailable(fd_set *set)
-    {
-        if(!FD_ISSET(endpoints[0x80], set))
-            return true;
-
-        return handleEP0Data(endpoints[0x80]);
-    }
-
     /* After each event, a roundtrip over usbredir is required.
      * After the response arrived, call this to look at the next event. */
-    void packetProcessed()
+    void packetProcessed(uint8_t ep)
     {
-        waiting_for_data = false;
+        endpoints.at(ep).waiting_for_answer = false;
     }
 
 private:
     std::string path;
     int dirfd = -1;
     usbredirparser *urp;
-    std::map<uint8_t, int> endpoints;
-
-    std::atomic_bool stop_threads{false}, waiting_for_data{false};
-    std::vector<std::thread> ep_threads;
+    std::atomic_bool stop_threads{false};
+    std::map<uint8_t, EPData> endpoints;
 };
 
 template<typename... Args>
@@ -707,7 +756,7 @@ bool gadget_init(UR2PPriv &priv)
 
 void ur2p_log(void *, int, const char *msg)
 {
-    printf("%s\n", msg);
+    debugPrintf("%s\n", msg);
 }
 
 int ur2p_read(void *ppriv, uint8_t *data, int count)
@@ -776,7 +825,7 @@ void ur2p_device_descriptor(UR2PPriv &priv, usb_device_descriptor *desc)
     if(priv.device.desc.bDescriptorType != USB_DT_DEVICE)
         fprintf(stderr, "Not a device descriptor?\n");
     else
-        printf("Got device descriptor (%.4x:%.4x)\n", priv.device.desc.idVendor, priv.device.desc.idProduct);
+        debugPrintf("Got device descriptor (%.4x:%.4x)\n", priv.device.desc.idVendor, priv.device.desc.idProduct);
 }
 
 void ur2p_config_descriptor(UR2PPriv &priv, uint8_t *data, int data_len)
@@ -1043,9 +1092,15 @@ template <typename T>
 {
     DECL_PRIV;
 
-    printf("Device: Received %s (%d bytes)\n", typeid(T).name(), data_len);
+    debugPrintf("Device: Received %s (%d bytes)\n", typeid(T).name(), data_len);
 
-    if(id == EP_FORWARD && priv.state == UR2PPriv::FORWARDING)
+    if(packet->status != usb_redir_success)
+    {
+        fprintf(stderr, "Packet error\n");
+        return;
+    }
+
+    if(priv.state == UR2PPriv::FORWARDING)
     {
         /* Forward packets */
         if(packet->endpoint & USB_DIR_IN)
@@ -1053,10 +1108,11 @@ template <typename T>
             if(!priv.ffs[0].writePacketEP(packet->endpoint, data, data_len))
                 fprintf(stderr, "Packet send failed\n");
         }
-        priv.ffs[0].packetProcessed();
+
+        priv.ffs[0].packetProcessed(packet->endpoint);
     }
     else
-        fprintf(stderr, "Got packet with unexpected id 0x%.8lx\n", id);
+        fprintf(stderr, "Got unexpected packet with id 0x%.8lx\n", id);
 
     if(data)
         usbredirparser_free_packet_data(priv.parser.get(), data);
@@ -1067,7 +1123,13 @@ template <>
 {
     DECL_PRIV;
 
-    printf("Device: Received %s (%d bytes)\n", typeid(usb_redir_control_packet_header).name(), data_len);
+    debugPrintf("Device: Received %s (%d bytes)\n", typeid(usb_redir_control_packet_header).name(), data_len);
+
+    if(packet->status != usb_redir_success)
+    {
+        fprintf(stderr, "Packet error\n");
+        return;
+    }
 
     if(id == EP_FORWARD && priv.state == UR2PPriv::FORWARDING)
     {
@@ -1077,26 +1139,12 @@ template <>
             if(!priv.ffs[0].writePacketEP(packet->endpoint, data, data_len))
                 fprintf(stderr, "Packet send failed\n");
         }
-        priv.ffs[0].packetProcessed();
+
+        /* Control packets can go in both directions */
+        priv.ffs[0].packetProcessed(packet->endpoint | USB_DIR_IN);
     }
     else
         ur2p_control_packet(ppriv, id, packet, data, data_len);
-
-    if(data)
-        usbredirparser_free_packet_data(priv.parser.get(), data);
-}
-
-template <>
-    void ur2p_packet_handler<usb_redir_interrupt_packet_header>(void *ppriv, uint64_t id, usb_redir_interrupt_packet_header *packet, uint8_t *data, int data_len)
-{
-    DECL_PRIV;
-
-    /* Forward packets */
-    if(data_len > 0 && (packet->endpoint & USB_DIR_IN))
-    {
-        if(!priv.ffs[0].writePacketEP(packet->endpoint, data, data_len))
-            fprintf(stderr, "Packet send failed\n");
-    }
 
     if(data)
         usbredirparser_free_packet_data(priv.parser.get(), data);
@@ -1128,7 +1176,7 @@ void ur2p_hello(void *, struct usb_redir_hello_header *header)
 }
 
 int main(int argc, char **argv)
-{
+try {
     UR2PPriv priv;
 
     priv.state = UR2PPriv::NO_IDEA;
@@ -1250,7 +1298,7 @@ int main(int argc, char **argv)
 
         for(auto && ffs : priv.ffs)
         {
-            if(!ffs.handleDataAvailable(&rfds))
+            if(!ffs.handleEP0Data(&rfds))
                 keep_running = false;
         }
 
@@ -1268,4 +1316,6 @@ int main(int argc, char **argv)
     }
 
     printf("Shutting down....\n");
+    return 0;
 }
+catch(...) { return 1; }

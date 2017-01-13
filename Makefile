@@ -1,4 +1,4 @@
-DEBUG := TRUE
+DEBUG := FALSE
 CC  = gcc
 CXX = g++
 
@@ -6,7 +6,7 @@ GCCFLAGS = -Wall -W -Wextra $(shell pkg-config --cflags libusbgx) -std=c++17 -Wn
 LDFLAGS = -pthread -lusbredirparser $(shell pkg-config --libs libusbgx)
 
 ifeq ($(DEBUG),FALSE)
-	GCCFLAGS += -Os
+	GCCFLAGS += -Os -D NDEBUG
 else
 	GCCFLAGS += -O0 -g
 endif
