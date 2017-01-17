@@ -1,4 +1,4 @@
-DEBUG := FALSE
+DEBUG := TRUE
 CC  = gcc
 CXX = g++
 

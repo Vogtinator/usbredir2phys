@@ -1,4 +1,6 @@
 Makefile
+usbfunctionfs.cpp
+usbfunctionfs.h
 usbredir2phys.ctempl
 usbredir2phys.cpp
 usb.h
