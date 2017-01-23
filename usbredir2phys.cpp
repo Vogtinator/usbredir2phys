@@ -194,7 +194,7 @@ struct UR2PPriv {
 };
 
 /* Set to false in the signal handler. */
-static volatile bool keep_running = true;
+static std::atomic_bool keep_running{true};
 
 void setup_signals()
 {
