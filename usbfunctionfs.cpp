@@ -211,10 +211,14 @@ bool USBFunctionFS::initForConfig(const USBDevice &dev, const USBConfiguration &
     e = write(ep0, request.data(), request.size());
     if(e != ssize_t(request.size()))
     {
-        perror("FFS EP0 strss write");
+        perror("FFS EP0 strs write");
         return false;
     }
 
+    /* FFS does not use the EP address, it uses consecutive numbers
+     * based on the descriptors we supplied...
+     * FFS, FFS! */
+    uint8_t index = 1;
     for(auto&& intf : config.interfaces)
         for(auto&& epAddr : intf.endpoints)
         {
@@ -224,8 +228,7 @@ bool USBFunctionFS::initForConfig(const USBDevice &dev, const USBConfiguration &
                 return false;
             }
 
-            // FFS does not use the EP address directly, only the endpoint number
-            auto epfd = openEP(epAddr & USB_ENDPOINT_NUMBER_MASK, false);
+            auto epfd = openEP(index += 1, false);
             if(epfd == -1)
             {
                 perror("FFS EP open");
