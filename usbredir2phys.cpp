@@ -922,6 +922,8 @@ try {
 
     // fdo#99015
     //usbredirparser_caps_set_cap(caps, usb_redir_cap_64bits_ids);
+    usbredirparser_caps_set_cap(caps, usb_redir_cap_ep_info_max_packet_size);
+    usbredirparser_caps_set_cap(caps, usb_redir_cap_connect_device_version);
 
     usbredirparser_caps_set_cap(caps, usb_redir_cap_bulk_receiving);
 
