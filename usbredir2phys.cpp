@@ -16,8 +16,6 @@
 #include <sys/types.h>
 #include <netdb.h>
 
-#include <boost/program_options.hpp>
-
 #include <usbredirparser.h>
 
 extern "C" {
@@ -366,7 +364,7 @@ bool gadget_init(UR2PPriv &priv)
 
         priv.poll_thread = std::thread{[&priv, &ffs, eps = std::move(poll_eps)] ()
         {
-            for(;;)
+            while(keep_running)
             {
                 for(auto &ep : eps)
                 {
