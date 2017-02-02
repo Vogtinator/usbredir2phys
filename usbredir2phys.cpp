@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -15,6 +16,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <netdb.h>
+#include <unistd.h>
 
 #include <usbredirparser.h>
 
@@ -171,7 +173,7 @@ struct UR2PPriv {
     USBDevice device;
 
     /* To be requested */
-    std::vector<uint32_t> missing_strings;
+    std::set<uint32_t> missing_strings;
 
     enum {
         NO_IDEA,
@@ -583,7 +585,7 @@ void ur2p_string_descriptor(UR2PPriv &priv, usb_string_descriptor *desc, size_t 
     if(desc->bDescriptorType != USB_DT_STRING)
         fprintf(stderr, "Not a string descriptor!\n");
 
-    size_t bytes = size - offsetof(usb_string_descriptor, wData);
+    size_t bytes = size - reinterpret_cast<size_t>(&(reinterpret_cast<usb_string_descriptor*>(0)->wData));
     std::u16string string{reinterpret_cast<char16_t*>(desc->wData), bytes / 2};
     priv.device.strings.strings[uint32_t(id)] = string;
 }
@@ -594,9 +596,9 @@ void ur2p_str0_descriptor(UR2PPriv &priv, usb_string_descriptor *desc, size_t si
         fprintf(stderr, "Not a string descriptor!\n");
 
     /* Save available lang ids */
-    size -= offsetof(usb_string_descriptor, wData);
+    size -= reinterpret_cast<size_t>(&(reinterpret_cast<usb_string_descriptor*>(0)->wData));
     for(unsigned int i = 0; i < size / 2; ++i)
-        priv.device.strings.langs.push_back(desc->wData[i]);
+        priv.device.strings.langs.insert(desc->wData[i]);
 }
 
 void ur2p_control_packet(void *ppriv, uint64_t id, struct usb_redir_control_packet_header *control_packet, uint8_t *data, int data_len)
@@ -695,16 +697,16 @@ void ur2p_control_packet(void *ppriv, uint64_t id, struct usb_redir_control_pack
         {
             /* Got STR0 descriptor, make a list of all referenced strings */
 
-            std::vector<uint8_t> strings;
+            std::set<uint8_t> strings;
             /* Referenced by device descriptor */
-            strings.insert(strings.end(), {priv.device.desc.iManufacturer, priv.device.desc.iProduct, priv.device.desc.iSerialNumber});
+            strings.insert({priv.device.desc.iManufacturer, priv.device.desc.iProduct, priv.device.desc.iSerialNumber});
             /* Referenced by config descriptors */
             for(auto &c : priv.device.configs)
             {
-                strings.push_back(c.desc.iConfiguration);
-                /* References by interface descriptors */
+                strings.insert(c.desc.iConfiguration);
+                /* Referenced by interface descriptors */
                 for(auto &i : c.interfaces)
-                    strings.push_back(i.desc.iInterface);
+                    strings.insert(i.desc.iInterface);
             }
 
             for(auto i : strings)
@@ -712,15 +714,17 @@ void ur2p_control_packet(void *ppriv, uint64_t id, struct usb_redir_control_pack
                 if(i == 0)
                     continue;
                 for(auto langid : priv.device.strings.langs)
-                    priv.missing_strings.push_back(makeString(langid, i));
+                    priv.missing_strings.insert(makeString(langid, i));
             }
         }
 
         // Need to fetch string descriptors?
         if(!priv.missing_strings.empty())
         {
-            auto string = priv.missing_strings.back();
-            priv.missing_strings.pop_back();
+            auto end = priv.missing_strings.end();
+            --end;
+            uint16_t string = *end;
+            priv.missing_strings.erase(end);
 
             usb_redir_control_packet_header header = {
                 .endpoint = USB_DIR_IN,

@@ -4,6 +4,7 @@
 #include <codecvt>
 #include <locale>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -55,7 +56,7 @@ struct USBConfiguration {
 };
 
 struct USBStrings {
-    std::vector<uint16_t> langs;
+    std::set<uint16_t> langs;
     // Use makeString as index
     std::map<uint32_t, std::u16string> strings;
 

@@ -218,7 +218,7 @@ bool USBFunctionFS::initForConfig(const USBDevice &dev, const USBConfiguration &
     /* FFS does not use the EP address, it uses consecutive numbers
      * based on the descriptors we supplied...
      * FFS, FFS! */
-    uint8_t index = 1;
+    uint8_t index = 0;
     for(auto&& intf : config.interfaces)
         for(auto&& epAddr : intf.endpoints)
         {
