@@ -180,6 +180,7 @@ bool USBFunctionFS::initForConfig(const USBDevice &dev, const USBConfiguration &
     request.insert(request.end(), config.full_desc.begin(), config.full_desc.end());
     request.insert(request.end(), config.full_desc.begin(), config.full_desc.end());
 
+    //auto e = write(open("/tmp/ep0descs", O_CREAT | O_WRONLY, 0777), request.data(), request.size());
     auto e = write(ep0, request.data(), request.size());
     if(e != ssize_t(request.size()))
     {
@@ -208,6 +209,7 @@ bool USBFunctionFS::initForConfig(const USBDevice &dev, const USBConfiguration &
     appendToVector(request, uint16_t(0x409));
     request.insert(request.end(), s.c_str(), s.c_str() + s.size());
 
+    //e = write(open("/tmp/ep0strs", O_CREAT | O_WRONLY, 0777), request.data(), request.size());
     e = write(ep0, request.data(), request.size());
     if(e != ssize_t(request.size()))
     {
