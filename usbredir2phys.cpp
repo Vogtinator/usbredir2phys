@@ -550,7 +550,7 @@ void ur2p_config_descriptor(UR2PPriv &priv, uint8_t *data, int data_len)
             }
 
             usb_endpoint_descriptor edesc;
-            memcpy(&edesc, data, size_t(data_len));
+            memcpy(&edesc, data, sizeof(edesc));
 
             /* Add endpoint */
             priv.device.endpoints[epAddrToIndex(edesc.bEndpointAddress)].desc = edesc;
@@ -723,7 +723,7 @@ void ur2p_control_packet(void *ppriv, uint64_t id, struct usb_redir_control_pack
         {
             auto end = priv.missing_strings.end();
             --end;
-            uint16_t string = *end;
+            uint32_t string = *end;
             priv.missing_strings.erase(end);
 
             usb_redir_control_packet_header header = {
