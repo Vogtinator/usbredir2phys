@@ -323,7 +323,7 @@ bool USBFunctionFS::handleEP0Data()
                 }
 
                 uint8_t data[USB_MAX_CTRL_SIZE];
-                if(!readPacketEP(0, data, event.u.setup.wLength))
+                if(!readPacketEP(0x80, data, event.u.setup.wLength))
                     perror("Warn: packet read");
 
                 ep0_cb(event.u.setup, data, event.u.setup.wLength);
