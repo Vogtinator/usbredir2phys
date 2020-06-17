@@ -266,9 +266,9 @@ bool gadget_init(UR2PPriv &priv)
 
     usbg_gadget_strs strs;
 
-    strncpy(strs.str_ser, serial.c_str(), USBG_MAX_STR_LENGTH);
-    strncpy(strs.str_prd, product.c_str(), USBG_MAX_STR_LENGTH);
-    strncpy(strs.str_mnf, manuf.c_str(), USBG_MAX_STR_LENGTH);
+    strs.serial = const_cast<char*>(serial.c_str());
+    strs.product = const_cast<char*>(product.c_str());
+    strs.manufacturer = const_cast<char*>(manuf.c_str());
 
     auto e = usbg_error(usbg_create_gadget(priv.usbg.s, "redir0", &attrs, &strs, &priv.usbg.g));
     if(e != USBG_SUCCESS)
@@ -284,7 +284,7 @@ bool gadget_init(UR2PPriv &priv)
         auto sConfig = priv.device.strings.getUTF8(0x409, conf.desc.iConfiguration);
 
         usbg_config_strs c_strs;
-        strncpy(c_strs.configuration, sConfig.c_str(), USBG_MAX_STR_LENGTH);
+        c_strs.configuration = const_cast<char*>(sConfig.c_str());
 
         char name[8];
         snprintf(name, sizeof(name), "conf%x", index);
@@ -295,7 +295,7 @@ bool gadget_init(UR2PPriv &priv)
         /* Each configuration has exactly one FFS function */
         usbg_function *g_f;
         snprintf(name, sizeof(name), "func%x", index);
-        e = usbg_error(usbg_create_function(priv.usbg.g, F_FFS, name, nullptr, &g_f));
+        e = usbg_error(usbg_create_function(priv.usbg.g, USBG_F_FFS, name, nullptr, &g_f));
         if(e != USBG_SUCCESS)
         {
             usbg_perror(e, "usbg_create_function");
